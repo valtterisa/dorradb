@@ -9,56 +9,45 @@ import (
 	"dorradb/internal/vfs"
 )
 
+const (
+	maxKeyBytes   = 1 << 10 // 1 KiB
+	maxValueBytes = 4 << 20 // 4 MiB
+)
+
 // DB is the public handle. All methods are safe to call from multiple goroutines;
 // the engine serializes mutations on one writer loop.
 type DB struct {
-	eng  *engine.Engine
-	opts Options
+	eng *engine.Engine
 }
 
 // Open creates or opens a database at path (SQLite-style file).
 // Also creates path-wal and path.lock as needed.
 func Open(path string) (*DB, error) {
-	return OpenOptions(Options{Path: path})
-}
-
-// OpenOptions is Open with tunables (checkpoint thresholds, sync, size limits).
-func OpenOptions(opts Options) (*DB, error) {
-	opts = opts.withDefaults()
-	if opts.Path == "" {
+	if path == "" {
 		return nil, errors.New("dorradb: empty path")
 	}
-	eng, err := engine.Open(engine.Options{
-		Path:                  opts.Path,
-		WALCheckpointBytes:    opts.WALCheckpointBytes,
-		WALCheckpointInterval: opts.WALCheckpointInterval,
-		SyncWAL:               opts.syncWAL(),
-		GroupCommitMaxOps:     opts.GroupCommitMaxOps,
-		GroupCommitMaxWait:    opts.GroupCommitMaxWait,
-		MaxKeyBytes:           opts.MaxKeyBytes,
-		MaxValueBytes:         opts.MaxValueBytes,
-	})
+	eng, err := engine.Open(path)
 	if err != nil {
 		return nil, mapErr(err)
 	}
-	return &DB{eng: eng, opts: opts}, nil
+	return &DB{eng: eng}, nil
 }
 
 // Get returns a copy of the value for key, or ErrNotFound.
 func (db *DB) Get(key []byte) ([]byte, error) {
-	if err := db.checkKey(key); err != nil {
+	if err := checkKey(key); err != nil {
 		return nil, err
 	}
 	val, err := db.eng.Get(key)
 	return val, mapErr(err)
 }
 
-// Set creates or overwrites key. Durable after return when SyncWAL is on.
+// Set creates or overwrites key. Durable after return (WAL is fsynced).
 func (db *DB) Set(key, value []byte) error {
-	if err := db.checkKey(key); err != nil {
+	if err := checkKey(key); err != nil {
 		return err
 	}
-	if len(value) > db.opts.MaxValueBytes {
+	if len(value) > maxValueBytes {
 		return ErrTooLarge
 	}
 	return mapErr(db.eng.Set(key, value))
@@ -66,7 +55,7 @@ func (db *DB) Set(key, value []byte) error {
 
 // Delete removes key. Missing keys are not an error.
 func (db *DB) Delete(key []byte) error {
-	if err := db.checkKey(key); err != nil {
+	if err := checkKey(key); err != nil {
 		return err
 	}
 	return mapErr(db.eng.Delete(key))
@@ -74,7 +63,7 @@ func (db *DB) Delete(key []byte) error {
 
 // Has reports whether key exists (no value copy).
 func (db *DB) Has(key []byte) (bool, error) {
-	if err := db.checkKey(key); err != nil {
+	if err := checkKey(key); err != nil {
 		return false, err
 	}
 	ok, err := db.eng.Has(key)
@@ -108,17 +97,16 @@ func (db *DB) Close() error {
 	return mapErr(db.eng.Close())
 }
 
-func (db *DB) checkKey(key []byte) error {
+func checkKey(key []byte) error {
 	if len(key) == 0 {
 		return ErrInvalidKey
 	}
-	if len(key) > db.opts.MaxKeyBytes {
+	if len(key) > maxKeyBytes {
 		return ErrTooLarge
 	}
 	return nil
 }
 
-// mapErr turns internal package errors into the public Err* values.
 func mapErr(err error) error {
 	if err == nil {
 		return nil

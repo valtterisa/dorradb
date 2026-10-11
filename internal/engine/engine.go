@@ -24,17 +24,14 @@ import (
 	"dorradb/internal/wal"
 )
 
-type Options struct {
-	Path                  string
-	FS                    vfs.FS // nil → vfs.OS()
-	WALCheckpointBytes    int64
-	WALCheckpointInterval time.Duration
-	SyncWAL               bool
-	GroupCommitMaxOps     int
-	GroupCommitMaxWait    time.Duration
-	MaxKeyBytes           int
-	MaxValueBytes         int
-}
+// Hardcoded MVP knobs (no public Options yet).
+const (
+	walCheckpointBytes    int64 = 8 << 20
+	walCheckpointInterval       = 30 * time.Second
+	syncWAL                     = true
+	groupCommitMaxOps           = 64
+	groupCommitMaxWait          = 2 * time.Millisecond
+)
 
 type Stats struct {
 	Path            string
@@ -75,7 +72,7 @@ type reply struct {
 
 // Engine owns the lock, main file, WAL, index, and the writer loop.
 type Engine struct {
-	opts Options
+	path string
 	fs   vfs.FS
 	lk   vfs.Lock
 	main *storage.Main
@@ -99,15 +96,12 @@ var (
 )
 
 // Open locks the DB, opens main+WAL via VFS, recovers, then starts the writer loop.
-func Open(opts Options) (*Engine, error) {
-	if opts.Path == "" {
+func Open(path string) (*Engine, error) {
+	if path == "" {
 		return nil, errors.New("engine: empty path")
 	}
-	fs := opts.FS
-	if fs == nil {
-		fs = vfs.OS()
-	}
-	dir := filepath.Dir(opts.Path)
+	fs := vfs.OS()
+	dir := filepath.Dir(path)
 	if dir != "." && dir != "" {
 		if err := fs.MkdirAll(dir, 0o755); err != nil {
 			return nil, err
@@ -115,17 +109,17 @@ func Open(opts Options) (*Engine, error) {
 	}
 
 	// Exclusive lock so two processes cannot open the same DB.
-	lk, err := fs.Lock(opts.Path + ".lock")
+	lk, err := fs.Lock(path + ".lock")
 	if err != nil {
 		return nil, err
 	}
 
-	main, err := storage.Open(fs, opts.Path, true)
+	main, err := storage.Open(fs, path, true)
 	if err != nil {
 		_ = lk.Unlock()
 		return nil, err
 	}
-	log, err := wal.Open(fs, opts.Path, true)
+	log, err := wal.Open(fs, path, true)
 	if err != nil {
 		_ = main.Close()
 		_ = lk.Unlock()
@@ -133,7 +127,7 @@ func Open(opts Options) (*Engine, error) {
 	}
 
 	e := &Engine{
-		opts:           opts,
+		path:           path,
 		fs:             fs,
 		lk:             lk,
 		main:           main,
@@ -258,7 +252,7 @@ func (e *Engine) handleStats(req request) {
 		dead = 0
 	}
 	req.reply <- reply{stats: Stats{
-		Path:            e.opts.Path,
+		Path:            e.path,
 		Seq:             e.seq,
 		LiveKeys:        e.idx.LiveCount(),
 		MainBytes:       mainSize,
@@ -271,9 +265,9 @@ func (e *Engine) handleStats(req request) {
 // handleMutations gathers a group of Sets/Deletes, then applyGroup (one WAL sync).
 func (e *Engine) handleMutations(first request) {
 	group := []request{first}
-	deadline := time.Now().Add(e.opts.GroupCommitMaxWait)
+	deadline := time.Now().Add(groupCommitMaxWait)
 gather:
-	for len(group) < e.opts.GroupCommitMaxOps {
+	for len(group) < groupCommitMaxOps {
 		wait := time.Until(deadline)
 		if wait <= 0 {
 			break
@@ -338,7 +332,7 @@ func (e *Engine) applyGroup(group []request) {
 		}
 		items = append(items, prepared{req: req, rec: rec, frameLen: int64(n)})
 	}
-	if e.opts.SyncWAL {
+	if syncWAL {
 		if err := e.log.Sync(); err != nil {
 			for _, r := range group {
 				r.reply <- reply{err: err}
@@ -364,8 +358,8 @@ func (e *Engine) maybeCheckpoint() {
 	if e.ckptInFlight || !e.mutationsSinceCkpt {
 		return
 	}
-	bySize := e.walBytesSinceCkpt >= e.opts.WALCheckpointBytes
-	byTime := time.Since(e.lastCheckpoint) >= e.opts.WALCheckpointInterval
+	bySize := e.walBytesSinceCkpt >= walCheckpointBytes
+	byTime := time.Since(e.lastCheckpoint) >= walCheckpointInterval
 	if bySize || byTime {
 		_ = e.compact()
 	}
@@ -406,7 +400,7 @@ func (e *Engine) compact() error {
 		return err
 	}
 
-	tmp := e.opts.Path + ".tmp"
+	tmp := e.path + ".tmp"
 	h := encode.Header{
 		FileType:            encode.FileTypeMain,
 		FormatVersion:       encode.FormatVersion,

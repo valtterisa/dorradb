@@ -41,8 +41,6 @@ The main file is append-only between checkpoints, so repeated updates of the sam
 - Max key: 1 KiB
 - Max value: 4 MiB
 
-Override via `Options`.
-
 ## CLI
 
 Easiest — interactive shell on `./app.dorradb`:
