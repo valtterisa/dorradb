@@ -1,7 +1,6 @@
 package dorradb
 
 import (
-	"context"
 	"errors"
 
 	"dorradb/internal/encode"
@@ -81,14 +80,6 @@ func (db *DB) Has(key []byte) (bool, error) {
 	return ok, mapErr(err)
 }
 
-// Checkpoint forces a compact of live keys into the main file and truncates the WAL.
-func (db *DB) Checkpoint(ctx context.Context) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	return mapErr(db.eng.Checkpoint(ctx))
-}
-
 // Stats returns sizes and counters (see Stats fields).
 func (db *DB) Stats() Stats {
 	s := db.eng.Stats()
@@ -99,7 +90,6 @@ func (db *DB) Stats() Stats {
 		MainBytes:       s.MainBytes,
 		WALBytes:        s.WALBytes,
 		ApproxDeadBytes: s.ApproxDeadBytes,
-		LastCheckpoint:  s.LastCheckpoint,
 	}
 }
 

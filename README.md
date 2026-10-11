@@ -48,7 +48,6 @@ err = db.Set([]byte("user:1"), []byte(`{"name":"Ada"}`))
 val, err := db.Get([]byte("user:1"))
 ok, err := db.Has([]byte("user:1"))
 err = db.Delete([]byte("user:1"))
-err = db.Checkpoint(context.Background())
 stats := db.Stats()
 ```
 
@@ -62,8 +61,7 @@ All methods are safe for concurrent use; mutations run on a single writer loop.
 | `Set` | Create or overwrite; durable after return when WAL sync is on (default) |
 | `Delete` | Missing keys are not an error |
 | `Has` | Existence check without copying the value |
-| `Checkpoint` | Compact live keys into the main file and truncate the WAL |
-| `Stats` | Path, seq, live keys, file sizes, approx dead bytes, last checkpoint |
+| `Stats` | Path, seq, live keys, file sizes, approx dead bytes |
 | `Close` | Flush, unlock, close files |
 
 ### Options
@@ -133,7 +131,6 @@ Ada
 dorradb> del name
 deleted
 dorradb> stats
-dorradb> compact
 dorradb> quit
 ```
 
@@ -146,7 +143,6 @@ go run ./cmd/dorradb set name Ada
 go run ./cmd/dorradb get name
 go run ./cmd/dorradb delete name
 go run ./cmd/dorradb status
-go run ./cmd/dorradb checkpoint
 go run ./cmd/dorradb set blob -   # value from stdin
 ```
 

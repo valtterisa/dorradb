@@ -3,14 +3,12 @@ package cli
 
 import (
 	"bufio"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"strings"
-	"time"
 
 	"dorradb"
 )
@@ -69,7 +67,7 @@ func Run(args []string) int {
 	}
 
 	switch cmd {
-	case "set", "get", "delete", "status", "checkpoint", "shell":
+	case "set", "get", "delete", "status", "shell":
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q — try: go run ./cmd/dorradb\n", cmd)
 		printUsage()
@@ -92,12 +90,6 @@ func Run(args []string) int {
 		return cmdDelete(db, cmdArgs)
 	case "status":
 		return cmdStatus(db, jsonOut)
-	case "checkpoint":
-		if err := db.Checkpoint(context.Background()); err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
-			return ExitError
-		}
-		return ExitOK
 	case "shell":
 		return cmdShell(db, dbPath)
 	}
@@ -198,7 +190,6 @@ func cmdStatus(db *dorradb.DB, jsonOut bool) int {
 	fmt.Printf("main_bytes=%d\n", s.MainBytes)
 	fmt.Printf("wal_bytes=%d\n", s.WALBytes)
 	fmt.Printf("approx_dead_bytes=%d\n", s.ApproxDeadBytes)
-	fmt.Printf("last_checkpoint=%s\n", s.LastCheckpoint.Format(time.RFC3339))
 	return ExitOK
 }
 
@@ -229,7 +220,6 @@ func cmdShell(db *dorradb.DB, dbPath string) int {
   get <key>           read
   del <key>           delete
   stats               info
-  compact             checkpoint / compact WAL
   quit`)
 		case "get":
 			if len(parts) < 2 {
@@ -271,12 +261,6 @@ func cmdShell(db *dorradb.DB, dbPath string) int {
 		case "stats", "status":
 			s := db.Stats()
 			fmt.Printf("keys=%d  seq=%d  main=%d bytes  wal=%d bytes\n", s.LiveKeys, s.Seq, s.MainBytes, s.WALBytes)
-		case "compact", "checkpoint":
-			if err := db.Checkpoint(context.Background()); err != nil {
-				fmt.Fprintf(os.Stderr, "error: %v\n", err)
-				continue
-			}
-			fmt.Println("compacted")
 		default:
 			fmt.Fprintf(os.Stderr, "unknown %q — type help\n", cmd)
 		}

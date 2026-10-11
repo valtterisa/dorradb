@@ -11,7 +11,6 @@
 package engine
 
 import (
-	"context"
 	"errors"
 	"path/filepath"
 	"sync/atomic"
@@ -41,7 +40,6 @@ const (
 	opHas
 	opSet
 	opDelete
-	opCheckpoint
 	opStats
 	opClose
 )
@@ -50,7 +48,6 @@ type request struct {
 	kind  opKind
 	key   []byte
 	value []byte
-	ctx   context.Context
 	reply chan reply
 }
 
@@ -212,8 +209,6 @@ func (e *Engine) loop() {
 			e.handleHas(req)
 		case opStats:
 			e.handleStats(req)
-		case opCheckpoint:
-			e.handleCheckpoint(req)
 		case opSet, opDelete:
 			e.handleMutations(req)
 		}
@@ -284,10 +279,6 @@ gather:
 				e.handleHas(req)
 			case opStats:
 				e.handleStats(req)
-			case opCheckpoint:
-				e.applyGroup(group)
-				e.handleCheckpoint(req)
-				return
 			}
 		case <-timer.C:
 			break gather
@@ -358,18 +349,6 @@ func (e *Engine) maybeCheckpoint() {
 	if bySize || byTime {
 		_ = e.compact()
 	}
-}
-
-func (e *Engine) handleCheckpoint(req request) {
-	if req.ctx != nil {
-		select {
-		case <-req.ctx.Done():
-			req.reply <- reply{err: req.ctx.Err()}
-			return
-		default:
-		}
-	}
-	req.reply <- reply{err: e.compact()}
 }
 
 // compact rewrites only live keys into *.tmp, renames over main, truncates WAL.
@@ -479,10 +458,6 @@ func (e *Engine) Set(key, value []byte) error {
 
 func (e *Engine) Delete(key []byte) error {
 	return e.call(request{kind: opDelete, key: append([]byte(nil), key...)}).err
-}
-
-func (e *Engine) Checkpoint(ctx context.Context) error {
-	return e.call(request{kind: opCheckpoint, ctx: ctx}).err
 }
 
 func (e *Engine) Stats() Stats {
