@@ -7,8 +7,10 @@ import (
 	"github.com/gofrs/flock"
 )
 
+// osFS is the default FS: thin wrappers around the Go os package + gofrs/flock.
 type osFS struct{}
 
+// osFile embeds *os.File so it satisfies vfs.File (ReadAt, WriteAt, Sync, …).
 type osFile struct {
 	*os.File
 }
@@ -33,6 +35,8 @@ func (osFS) Remove(name string) error {
 	return os.Remove(name)
 }
 
+// SyncDir flushes the directory entry for path (after rename of a checkpoint).
+// Actual syscalls live in sync_unix.go / sync_windows.go.
 func (osFS) SyncDir(path string) error {
 	return syncDir(filepath.Dir(path))
 }
@@ -41,6 +45,8 @@ type osLock struct {
 	f *flock.Flock
 }
 
+// Lock tries to take an exclusive non-blocking lock on path.
+// gofrs/flock uses flock on Unix and LockFileEx on Windows.
 func (osFS) Lock(path string) (Lock, error) {
 	f := flock.New(path)
 	ok, err := f.TryLock()

@@ -9,15 +9,20 @@ import (
 	"dorradb/internal/vfs"
 )
 
+// DB is the public handle. All methods are safe to call from multiple goroutines;
+// the engine serializes mutations on one writer loop.
 type DB struct {
 	eng  *engine.Engine
 	opts Options
 }
 
+// Open creates or opens a database at path (SQLite-style file).
+// Also creates path-wal and path.lock as needed.
 func Open(path string) (*DB, error) {
 	return OpenOptions(Options{Path: path})
 }
 
+// OpenOptions is Open with tunables (checkpoint thresholds, sync, size limits).
 func OpenOptions(opts Options) (*DB, error) {
 	opts = opts.withDefaults()
 	if opts.Path == "" {
@@ -39,6 +44,7 @@ func OpenOptions(opts Options) (*DB, error) {
 	return &DB{eng: eng, opts: opts}, nil
 }
 
+// Get returns a copy of the value for key, or ErrNotFound.
 func (db *DB) Get(key []byte) ([]byte, error) {
 	if err := db.checkKey(key); err != nil {
 		return nil, err
@@ -47,6 +53,7 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 	return val, mapErr(err)
 }
 
+// Set creates or overwrites key. Durable after return when SyncWAL is on.
 func (db *DB) Set(key, value []byte) error {
 	if err := db.checkKey(key); err != nil {
 		return err
@@ -57,6 +64,7 @@ func (db *DB) Set(key, value []byte) error {
 	return mapErr(db.eng.Set(key, value))
 }
 
+// Delete removes key. Missing keys are not an error.
 func (db *DB) Delete(key []byte) error {
 	if err := db.checkKey(key); err != nil {
 		return err
@@ -64,6 +72,7 @@ func (db *DB) Delete(key []byte) error {
 	return mapErr(db.eng.Delete(key))
 }
 
+// Has reports whether key exists (no value copy).
 func (db *DB) Has(key []byte) (bool, error) {
 	if err := db.checkKey(key); err != nil {
 		return false, err
@@ -72,6 +81,7 @@ func (db *DB) Has(key []byte) (bool, error) {
 	return ok, mapErr(err)
 }
 
+// Checkpoint forces a compact of live keys into the main file and truncates the WAL.
 func (db *DB) Checkpoint(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -79,6 +89,7 @@ func (db *DB) Checkpoint(ctx context.Context) error {
 	return mapErr(db.eng.Checkpoint(ctx))
 }
 
+// Stats returns sizes and counters (see Stats fields).
 func (db *DB) Stats() Stats {
 	s := db.eng.Stats()
 	return Stats{
@@ -92,6 +103,7 @@ func (db *DB) Stats() Stats {
 	}
 }
 
+// Close flushes, releases the file lock, and closes files. Safe to call once.
 func (db *DB) Close() error {
 	return mapErr(db.eng.Close())
 }
@@ -106,6 +118,7 @@ func (db *DB) checkKey(key []byte) error {
 	return nil
 }
 
+// mapErr turns internal package errors into the public Err* values.
 func mapErr(err error) error {
 	if err == nil {
 		return nil

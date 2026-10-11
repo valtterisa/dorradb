@@ -1,3 +1,4 @@
+// Package cli implements the dorradb command-line tool (file ops, no network).
 package cli
 
 import (
@@ -17,9 +18,10 @@ import (
 const (
 	ExitOK       = 0
 	ExitError    = 1
-	ExitNotFound = 2
+	ExitNotFound = 2 // get: key missing
 )
 
+// Run parses flags/subcommand and returns a process exit code.
 func Run(args []string) int {
 	var dbPath string
 	var jsonOut bool

@@ -3,25 +3,36 @@ package dorradb
 import "time"
 
 const (
-	DefaultWALCheckpointBytes    int64 = 8 << 20
+	DefaultWALCheckpointBytes    int64 = 8 << 20 // 8 MiB of WAL growth → compact
 	DefaultWALCheckpointInterval       = 30 * time.Second
 	DefaultGroupCommitMaxOps           = 64
 	DefaultGroupCommitMaxWait          = 2 * time.Millisecond
-	DefaultMaxKeyBytes                 = 1 << 10
-	DefaultMaxValueBytes               = 4 << 20
+	DefaultMaxKeyBytes                 = 1 << 10 // 1 KiB
+	DefaultMaxValueBytes               = 4 << 20 // 4 MiB
 )
 
+// Options configures OpenOptions. Zero values get defaults via withDefaults.
 type Options struct {
-	Path                  string
-	WALCheckpointBytes    int64
+	Path string // e.g. "app.dorradb"
+
+	// Checkpoint when WAL has grown this many bytes since last compact.
+	WALCheckpointBytes int64
+	// Or when this much time passed (and there were writes).
 	WALCheckpointInterval time.Duration
-	SyncWAL               *bool
-	GroupCommitMaxOps     int
-	GroupCommitMaxWait    time.Duration
-	MaxKeyBytes           int
-	MaxValueBytes         int
+
+	// SyncWAL: nil or true → fsync WAL before ack (durable).
+	// Use Bool(false) to disable for benchmarks (not crash-safe).
+	SyncWAL *bool
+
+	// Group commit: batch up to N mutations or wait up to MaxWait, then one fsync.
+	GroupCommitMaxOps  int
+	GroupCommitMaxWait time.Duration
+
+	MaxKeyBytes   int
+	MaxValueBytes int
 }
 
+// Bool is a helper so callers can set SyncWAL: dorradb.Bool(false).
 func Bool(v bool) *bool { return &v }
 
 func (o Options) withDefaults() Options {

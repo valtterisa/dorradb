@@ -2,6 +2,7 @@ package dorradb
 
 import "errors"
 
+// Public errors callers can check with errors.Is.
 var (
 	ErrNotFound           = errors.New("dorradb: key not found")
 	ErrInvalidKey         = errors.New("dorradb: invalid key")

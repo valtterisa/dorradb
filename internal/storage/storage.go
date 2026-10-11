@@ -1,3 +1,5 @@
+// Package storage owns the main *.dorradb file: append records, ReadAt values,
+// scan into the RAM index, and replace the file during checkpoint compact.
 package storage
 
 import (
@@ -11,6 +13,7 @@ import (
 	"dorradb/internal/vfs"
 )
 
+// Main is the open main database file (header + append-only framed records).
 type Main struct {
 	fs   vfs.FS
 	path string
@@ -19,6 +22,7 @@ type Main struct {
 	hdr  encode.Header
 }
 
+// Open creates or opens the main DB file through the VFS.
 func Open(fs vfs.FS, dbPath string, create bool) (*Main, error) {
 	if fs == nil {
 		fs = vfs.OS()
@@ -98,6 +102,7 @@ func (m *Main) SetHeader(h encode.Header) error {
 	return nil
 }
 
+// Append writes one framed record at the end of the file and returns its Loc for the index.
 func (m *Main) Append(rec encode.Record) (index.Loc, error) {
 	frame := encode.EncodeFrame(rec)
 	off := m.size
@@ -120,6 +125,7 @@ func (m *Main) Append(rec encode.Record) (index.Loc, error) {
 	return loc, nil
 }
 
+// ReadValue loads value bytes from disk using the index Loc (not from RAM).
 func (m *Main) ReadValue(loc index.Loc) ([]byte, error) {
 	if loc.Deleted || loc.ValueLen == 0 {
 		return nil, nil
@@ -131,6 +137,8 @@ func (m *Main) ReadValue(loc index.Loc) ([]byte, error) {
 	return buf, nil
 }
 
+// ScanIndex rebuilds the RAM index by reading every good frame.
+// Stops at a torn/corrupt tail (crash mid-write); mid-file CRC → ErrMidCRC.
 func (m *Main) ScanIndex(idx *index.Index) error {
 	idx.Reset()
 	if m.size <= encode.HeaderSize {
@@ -175,6 +183,8 @@ func (m *Main) ScanIndex(idx *index.Index) error {
 	return nil
 }
 
+// ReplaceWithCompact atomically swaps in a compacted file:
+// close old → rename tmp over path → SyncDir → reopen.
 func (m *Main) ReplaceWithCompact(tmpPath string, h encode.Header, newSize int64) error {
 	if err := m.f.Close(); err != nil {
 		return err
@@ -205,6 +215,7 @@ func (m *Main) Close() error {
 	return err
 }
 
+// WriteCompactFile writes header + only live Set records to a temp file and fsyncs it.
 func WriteCompactFile(fs vfs.FS, tmpPath string, h encode.Header, records []encode.Record) (int64, error) {
 	if fs == nil {
 		fs = vfs.OS()

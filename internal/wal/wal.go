@@ -1,3 +1,5 @@
+// Package wal is the write-ahead log (path+"-wal").
+// Durability rule: append mutation frames, Sync, then the engine applies to main.
 package wal
 
 import (
@@ -9,6 +11,7 @@ import (
 	"dorradb/internal/vfs"
 )
 
+// Log is the open WAL file.
 type Log struct {
 	fs   vfs.FS
 	path string
@@ -20,6 +23,7 @@ func PathFor(dbPath string) string {
 	return dbPath + "-wal"
 }
 
+// Open creates or opens the WAL sidecar next to the main DB file.
 func Open(fs vfs.FS, dbPath string, create bool) (*Log, error) {
 	if fs == nil {
 		fs = vfs.OS()
@@ -73,6 +77,7 @@ func (w *Log) Path() string { return w.path }
 
 func (w *Log) Size() int64 { return w.size }
 
+// Append writes one frame (no fsync — caller Syncs once per group).
 func (w *Log) Append(rec encode.Record) (int64, int, error) {
 	frame := encode.EncodeFrame(rec)
 	off := w.size
@@ -87,6 +92,7 @@ func (w *Log) Sync() error {
 	return w.f.Sync()
 }
 
+// Replay walks frames from fromOffset to EOF. Torn last record → stop cleanly.
 func (w *Log) Replay(fromOffset int64, fn func(encode.FrameView) error) error {
 	if fromOffset < encode.HeaderSize {
 		fromOffset = encode.HeaderSize
@@ -132,6 +138,7 @@ func (w *Log) Replay(fromOffset int64, fn func(encode.FrameView) error) error {
 	return nil
 }
 
+// TruncateReset clears the WAL after a successful checkpoint (header only).
 func (w *Log) TruncateReset() error {
 	if err := w.f.Truncate(0); err != nil {
 		return err

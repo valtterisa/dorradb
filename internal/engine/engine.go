@@ -1,3 +1,13 @@
+// Package engine is the single-writer core of DoraDB.
+//
+// Write path (Set/Delete):
+//  1. queue request to the writer goroutine
+//  2. group-commit: append several WAL records, one Sync
+//  3. append same records to main file + update RAM index
+//  4. reply OK
+//  5. maybe checkpoint (WAL size or time)
+//
+// Recovery on Open: scan main → replay WAL records with seq > main max seq.
 package engine
 
 import (
@@ -16,7 +26,7 @@ import (
 
 type Options struct {
 	Path                  string
-	FS                    vfs.FS
+	FS                    vfs.FS // nil → vfs.OS()
 	WALCheckpointBytes    int64
 	WALCheckpointInterval time.Duration
 	SyncWAL               bool
@@ -63,6 +73,7 @@ type reply struct {
 	err   error
 }
 
+// Engine owns the lock, main file, WAL, index, and the writer loop.
 type Engine struct {
 	opts Options
 	fs   vfs.FS
@@ -71,15 +82,15 @@ type Engine struct {
 	log  *wal.Log
 	idx  *index.Index
 
-	seq                uint64
+	seq                uint64 // next mutation gets seq+1
 	walBytesSinceCkpt  int64
 	lastCheckpoint     time.Time
 	mutationsSinceCkpt bool
 	ckptInFlight       bool
 
-	reqCh  chan request
+	reqCh  chan request // all API calls enqueue here
 	closed atomic.Bool
-	done   chan struct{}
+	done   chan struct{} // closed when writer loop exits
 }
 
 var (
@@ -87,6 +98,7 @@ var (
 	ErrClosed   = errors.New("engine: closed")
 )
 
+// Open locks the DB, opens main+WAL via VFS, recovers, then starts the writer loop.
 func Open(opts Options) (*Engine, error) {
 	if opts.Path == "" {
 		return nil, errors.New("engine: empty path")
@@ -102,6 +114,7 @@ func Open(opts Options) (*Engine, error) {
 		}
 	}
 
+	// Exclusive lock so two processes cannot open the same DB.
 	lk, err := fs.Lock(opts.Path + ".lock")
 	if err != nil {
 		return nil, err
@@ -140,6 +153,7 @@ func Open(opts Options) (*Engine, error) {
 	return e, nil
 }
 
+// recover: load index from main, then replay WAL for seqs not yet on main.
 func (e *Engine) recover() error {
 	if err := e.main.ScanIndex(e.idx); err != nil {
 		return err
@@ -191,6 +205,7 @@ func (e *Engine) cleanup() {
 	}
 }
 
+// loop is the only goroutine that mutates index/main/WAL.
 func (e *Engine) loop() {
 	defer close(e.done)
 	for {
@@ -253,6 +268,7 @@ func (e *Engine) handleStats(req request) {
 	}}
 }
 
+// handleMutations gathers a group of Sets/Deletes, then applyGroup (one WAL sync).
 func (e *Engine) handleMutations(first request) {
 	group := []request{first}
 	deadline := time.Now().Add(e.opts.GroupCommitMaxWait)
@@ -292,6 +308,8 @@ gather:
 	e.maybeCheckpoint()
 }
 
+// applyGroup: WAL append all → Sync once → apply to main + index → ack.
+// If Sync fails, nothing is applied to main (WAL may still have bytes on disk).
 func (e *Engine) applyGroup(group []request) {
 	if len(group) == 0 {
 		return
@@ -341,6 +359,7 @@ func (e *Engine) applyGroup(group []request) {
 	}
 }
 
+// maybeCheckpoint triggers compact when WAL grew enough or enough time passed.
 func (e *Engine) maybeCheckpoint() {
 	if e.ckptInFlight || !e.mutationsSinceCkpt {
 		return
@@ -364,6 +383,7 @@ func (e *Engine) handleCheckpoint(req request) {
 	req.reply <- reply{err: e.compact()}
 }
 
+// compact rewrites only live keys into *.tmp, renames over main, truncates WAL.
 func (e *Engine) compact() error {
 	e.ckptInFlight = true
 	defer func() { e.ckptInFlight = false }()

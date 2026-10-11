@@ -1,3 +1,5 @@
+// Package encode is the on-disk binary format: file headers and framed records.
+// Everything is little-endian. Each record is: len | payload | CRC32.
 package encode
 
 import (
@@ -7,11 +9,12 @@ import (
 )
 
 const (
-	Magic         uint32 = 0x41524F44 // "DORA" as LE bytes D,O,R,A
+	// Magic is ASCII "DORA" stored as a little-endian uint32.
+	Magic         uint32 = 0x41524F44
 	FileTypeMain  uint8  = 1
 	FileTypeWAL   uint8  = 2
 	FormatVersion uint8  = 1
-	HeaderSize           = 64
+	HeaderSize           = 64 // fixed header at the start of main + WAL files
 
 	OpSet    uint8 = 1
 	OpDelete uint8 = 2
@@ -23,17 +26,18 @@ var (
 	ErrMagic    = errors.New("encode: bad magic")
 	ErrVersion  = errors.New("encode: unsupported version")
 	ErrFileType = errors.New("encode: bad file type")
-	ErrTorn     = errors.New("encode: torn record")
-	ErrMidCRC   = errors.New("encode: mid-file crc failure")
+	ErrTorn     = errors.New("encode: torn record")          // incomplete last record (crash)
+	ErrMidCRC   = errors.New("encode: mid-file crc failure") // corrupt, not just a torn tail
 )
 
 var crcTable = crc32.MakeTable(crc32.IEEE)
 
+// Header sits at offset 0 of main and WAL files.
 type Header struct {
 	FileType            uint8
 	FormatVersion       uint8
-	Seq                 uint64
-	WalCheckpointOffset uint64
+	Seq                 uint64 // highest seq included in this file (after compact)
+	WalCheckpointOffset uint64 // WAL byte offset where replay should start
 }
 
 func AppendU32(b []byte, v uint32) []byte {
@@ -52,6 +56,7 @@ func CRC(data []byte) uint32 {
 	return crc32.Checksum(data, crcTable)
 }
 
+// EncodeHeader writes a 64-byte header with a CRC over the first 60 bytes.
 func EncodeHeader(h Header) []byte {
 	buf := make([]byte, HeaderSize)
 	binary.LittleEndian.PutUint32(buf[0:4], Magic)
@@ -81,22 +86,22 @@ func DecodeHeader(buf []byte) (Header, error) {
 		Seq:                 binary.LittleEndian.Uint64(buf[8:16]),
 		WalCheckpointOffset: binary.LittleEndian.Uint64(buf[16:24]),
 	}
-	if h.FormatVersion > FormatVersion {
-		return Header{}, ErrVersion
-	}
+	// Version gate: refuse anything we don't understand.
 	if h.FormatVersion != FormatVersion {
 		return Header{}, ErrVersion
 	}
 	return h, nil
 }
 
+// Record is one logical mutation (also what we store in the main data file).
 type Record struct {
-	Seq   uint64
+	Seq   uint64 // monotonic commit/version number (hook for future MVCC)
 	Op    uint8
 	Key   []byte
-	Value []byte
+	Value []byte // empty for Delete
 }
 
+// Payload layout: seq u64 | op u8 | keyLen u32 | key | valLen u32 | value
 func EncodePayload(r Record) []byte {
 	keyLen := uint32(len(r.Key))
 	valLen := uint32(len(r.Value))
@@ -138,6 +143,7 @@ func DecodePayload(p []byte) (Record, error) {
 	return r, nil
 }
 
+// EncodeFrame wraps payload as: len u32 | payload | crc32.
 func EncodeFrame(r Record) []byte {
 	payload := EncodePayload(r)
 	frame := make([]byte, 0, 4+len(payload)+4)
@@ -147,21 +153,24 @@ func EncodeFrame(r Record) []byte {
 	return frame
 }
 
-const FrameOverhead = 8
+const FrameOverhead = 8 // len + crc
 
 func FrameSize(payloadLen int) int {
 	return 4 + payloadLen + 4
 }
 
+// FrameView is a decoded frame plus where it lives in the file (for ReadAt of values).
 type FrameView struct {
 	Record     Record
-	Offset     int64
-	Length     int64
-	ValueOff   int64
+	Offset     int64 // start of frame in file
+	Length     int64 // full frame size
+	ValueOff   int64 // absolute offset of value bytes
 	ValueLen   int
 	PayloadOff int64
 }
 
+// DecodeFrameAt parses one frame from data (usually a slice of the file).
+// fileOff is the absolute file offset of data[0] so ValueOff is absolute too.
 func DecodeFrameAt(data []byte, fileOff int64) (FrameView, int, error) {
 	if len(data) < 4 {
 		return FrameView{}, 0, ErrTorn
@@ -180,6 +189,7 @@ func DecodeFrameAt(data []byte, fileOff int64) (FrameView, int, error) {
 	if err != nil {
 		return FrameView{}, 0, err
 	}
+	// value starts after seq+op+keyLen+key+valLen inside the payload.
 	valueOffInPayload := 8 + 1 + 4 + len(rec.Key) + 4
 	fv := FrameView{
 		Record:     rec,
