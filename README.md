@@ -1,12 +1,14 @@
 # DoraDB
 
-Embedded key-value library for Go. SQLite-style files (stdlib + [`gofrs/flock`](https://github.com/gofrs/flock) for cross-platform file locking):
+Embedded key-value library for Go (**Linux and Windows**). SQLite-style files, with OS differences behind an internal **VFS** (stdlib + [`gofrs/flock`](https://github.com/gofrs/flock)):
 
 ```text
 app.dorradb         # main database
 app.dorradb-wal     # write-ahead log
 app.dorradb.lock    # exclusive advisory lock (via gofrs/flock)
 ```
+
+Engine code talks to `vfs.FS` only. The default OS VFS maps that to native open/read/write/sync/rename and platform directory sync after checkpoint rename.
 
 ## Embed
 
@@ -22,7 +24,7 @@ v, err := db.Get([]byte("k"))
 _ = db.Delete([]byte("k"))
 ```
 
-`Open` creates the database if it does not exist. Only one process may open a given path at a time (`ErrLocked` if another process holds the advisory lock). The OS releases the lock when the process exits or crashes — no PID file reclaim.
+`Open` creates the database if it does not exist. Only one process may open a given path at a time (`ErrLocked` if another process holds the advisory lock). The OS releases the lock when the process exits or crashes.
 
 ### Durability
 
@@ -44,7 +46,7 @@ Override via `Options`.
 ## CLI
 
 ```bash
-go build -o dorradb.exe ./cmd/dorradb
+go build -o dorradb ./cmd/dorradb
 
 ./dorradb --db app.dorradb set foo bar
 ./dorradb --db app.dorradb get foo

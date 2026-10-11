@@ -6,12 +6,13 @@ import (
 	"os"
 
 	"dorradb/internal/encode"
-	"dorradb/internal/fsutil"
+	"dorradb/internal/vfs"
 )
 
 type Log struct {
+	fs   vfs.FS
 	path string
-	f    *os.File
+	f    vfs.File
 	size int64
 }
 
@@ -19,13 +20,16 @@ func PathFor(dbPath string) string {
 	return dbPath + "-wal"
 }
 
-func Open(dbPath string, create bool) (*Log, error) {
+func Open(fs vfs.FS, dbPath string, create bool) (*Log, error) {
+	if fs == nil {
+		fs = vfs.OS()
+	}
 	path := PathFor(dbPath)
 	flag := os.O_RDWR
 	if create {
 		flag |= os.O_CREATE
 	}
-	f, err := os.OpenFile(path, flag, 0o644)
+	f, err := fs.OpenFile(path, flag, 0o644)
 	if err != nil {
 		return nil, err
 	}
@@ -34,7 +38,7 @@ func Open(dbPath string, create bool) (*Log, error) {
 		f.Close()
 		return nil, err
 	}
-	w := &Log{path: path, f: f, size: info.Size()}
+	w := &Log{fs: fs, path: path, f: f, size: info.Size()}
 	if w.size == 0 {
 		h := encode.Header{FileType: encode.FileTypeWAL, FormatVersion: encode.FormatVersion}
 		if _, err := f.Write(encode.EncodeHeader(h)); err != nil {
@@ -80,7 +84,7 @@ func (w *Log) Append(rec encode.Record) (int64, int, error) {
 }
 
 func (w *Log) Sync() error {
-	return fsutil.SyncFile(w.f)
+	return w.f.Sync()
 }
 
 func (w *Log) Replay(fromOffset int64, fn func(encode.FrameView) error) error {

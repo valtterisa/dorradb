@@ -6,7 +6,7 @@ import (
 
 	"dorradb/internal/encode"
 	"dorradb/internal/engine"
-	"dorradb/internal/lock"
+	"dorradb/internal/vfs"
 )
 
 type DB struct {
@@ -115,7 +115,7 @@ func mapErr(err error) error {
 		return ErrNotFound
 	case errors.Is(err, engine.ErrClosed):
 		return ErrClosed
-	case errors.Is(err, lock.ErrLocked):
+	case errors.Is(err, vfs.ErrLocked):
 		return ErrLocked
 	case errors.Is(err, encode.ErrVersion):
 		return ErrUnsupportedVersion

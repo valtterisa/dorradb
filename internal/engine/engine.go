@@ -3,20 +3,20 @@ package engine
 import (
 	"context"
 	"errors"
-	"os"
 	"path/filepath"
 	"sync/atomic"
 	"time"
 
 	"dorradb/internal/encode"
 	"dorradb/internal/index"
-	"dorradb/internal/lock"
 	"dorradb/internal/storage"
+	"dorradb/internal/vfs"
 	"dorradb/internal/wal"
 )
 
 type Options struct {
 	Path                  string
+	FS                    vfs.FS
 	WALCheckpointBytes    int64
 	WALCheckpointInterval time.Duration
 	SyncWAL               bool
@@ -65,7 +65,8 @@ type reply struct {
 
 type Engine struct {
 	opts Options
-	lk   *lock.FileLock
+	fs   vfs.FS
+	lk   vfs.Lock
 	main *storage.Main
 	log  *wal.Log
 	idx  *index.Index
@@ -90,32 +91,37 @@ func Open(opts Options) (*Engine, error) {
 	if opts.Path == "" {
 		return nil, errors.New("engine: empty path")
 	}
+	fs := opts.FS
+	if fs == nil {
+		fs = vfs.OS()
+	}
 	dir := filepath.Dir(opts.Path)
 	if dir != "." && dir != "" {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
+		if err := fs.MkdirAll(dir, 0o755); err != nil {
 			return nil, err
 		}
 	}
 
-	lk, err := lock.Acquire(opts.Path)
+	lk, err := fs.Lock(opts.Path + ".lock")
 	if err != nil {
 		return nil, err
 	}
 
-	main, err := storage.Open(opts.Path, true)
+	main, err := storage.Open(fs, opts.Path, true)
 	if err != nil {
-		lk.Release()
+		_ = lk.Unlock()
 		return nil, err
 	}
-	log, err := wal.Open(opts.Path, true)
+	log, err := wal.Open(fs, opts.Path, true)
 	if err != nil {
-		main.Close()
-		lk.Release()
+		_ = main.Close()
+		_ = lk.Unlock()
 		return nil, err
 	}
 
 	e := &Engine{
 		opts:           opts,
+		fs:             fs,
 		lk:             lk,
 		main:           main,
 		log:            log,
@@ -181,7 +187,7 @@ func (e *Engine) cleanup() {
 		e.main.Close()
 	}
 	if e.lk != nil {
-		e.lk.Release()
+		_ = e.lk.Unlock()
 	}
 }
 
@@ -387,13 +393,13 @@ func (e *Engine) compact() error {
 		Seq:                 e.seq,
 		WalCheckpointOffset: encode.HeaderSize,
 	}
-	newSize, err := storage.WriteCompactFile(tmp, h, records)
+	newSize, err := storage.WriteCompactFile(e.fs, tmp, h, records)
 	if err != nil {
-		os.Remove(tmp)
+		_ = e.fs.Remove(tmp)
 		return err
 	}
 	if err := e.main.ReplaceWithCompact(tmp, h, newSize); err != nil {
-		os.Remove(tmp)
+		_ = e.fs.Remove(tmp)
 		return err
 	}
 	if err := e.log.TruncateReset(); err != nil {
@@ -413,7 +419,11 @@ func (e *Engine) finishClose(req request) {
 	_ = e.log.Sync()
 	err1 := e.log.Close()
 	err2 := e.main.Close()
-	err3 := e.lk.Release()
+	var err3 error
+	if e.lk != nil {
+		err3 = e.lk.Unlock()
+		e.lk = nil
+	}
 	err := err1
 	if err == nil {
 		err = err2

@@ -1,5 +1,4 @@
 // Package dorradb is an embedded key-value store with a WAL and checkpoints.
-// File locking uses github.com/gofrs/flock.
 //
 // Open a database file (created if missing):
 //
@@ -9,5 +8,7 @@
 // index maps keys to offsets. Mutations are group-committed to the WAL before
 // being applied to the main file.
 //
-// Seq numbers on records leave room for future MVCC/OCC without changing Open.
+// OS I/O goes through an internal VFS (Linux and Windows). File locking uses
+// github.com/gofrs/flock. Seq numbers on records leave room for future MVCC/OCC
+// without changing Open.
 package dorradb

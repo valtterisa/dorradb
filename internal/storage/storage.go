@@ -7,26 +7,33 @@ import (
 	"path/filepath"
 
 	"dorradb/internal/encode"
-	"dorradb/internal/fsutil"
 	"dorradb/internal/index"
+	"dorradb/internal/vfs"
 )
 
 type Main struct {
+	fs   vfs.FS
 	path string
-	f    *os.File
+	f    vfs.File
 	size int64
 	hdr  encode.Header
 }
 
-func Open(dbPath string, create bool) (*Main, error) {
+func Open(fs vfs.FS, dbPath string, create bool) (*Main, error) {
+	if fs == nil {
+		fs = vfs.OS()
+	}
 	flag := os.O_RDWR
 	if create {
 		flag |= os.O_CREATE
 	}
-	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil && filepath.Dir(dbPath) != "." {
-		return nil, err
+	dir := filepath.Dir(dbPath)
+	if dir != "." && dir != "" {
+		if err := fs.MkdirAll(dir, 0o755); err != nil {
+			return nil, err
+		}
 	}
-	f, err := os.OpenFile(dbPath, flag, 0o644)
+	f, err := fs.OpenFile(dbPath, flag, 0o644)
 	if err != nil {
 		return nil, err
 	}
@@ -35,7 +42,7 @@ func Open(dbPath string, create bool) (*Main, error) {
 		f.Close()
 		return nil, err
 	}
-	m := &Main{path: dbPath, f: f, size: info.Size()}
+	m := &Main{fs: fs, path: dbPath, f: f, size: info.Size()}
 	if m.size == 0 {
 		h := encode.Header{
 			FileType:            encode.FileTypeMain,
@@ -173,13 +180,13 @@ func (m *Main) ReplaceWithCompact(tmpPath string, h encode.Header, newSize int64
 		return err
 	}
 	m.f = nil
-	if err := os.Rename(tmpPath, m.path); err != nil {
+	if err := m.fs.Rename(tmpPath, m.path); err != nil {
 		return err
 	}
-	if err := fsutil.SyncDir(m.path); err != nil {
+	if err := m.fs.SyncDir(m.path); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(m.path, os.O_RDWR, 0o644)
+	f, err := m.fs.OpenFile(m.path, os.O_RDWR, 0o644)
 	if err != nil {
 		return err
 	}
@@ -198,8 +205,11 @@ func (m *Main) Close() error {
 	return err
 }
 
-func WriteCompactFile(tmpPath string, h encode.Header, records []encode.Record) (int64, error) {
-	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+func WriteCompactFile(fs vfs.FS, tmpPath string, h encode.Header, records []encode.Record) (int64, error) {
+	if fs == nil {
+		fs = vfs.OS()
+	}
+	f, err := fs.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
 	if err != nil {
 		return 0, err
 	}
