@@ -16,9 +16,24 @@ app.dorradb.lock    # exclusive advisory lock
 
 ## Goals
 
+### Engine
+
 - [x] One writer at a time, WAL + checkpoint, exclusive file lock
 - [x] Version numbers (`seq`) on every record
-- [ ] **Many readers + one writer at a time** (SQLite WAL-style) — do this with **MVCC** snapshots so `Get` doesn’t wait on the writer
+- [ ] **MVCC + multi-reader** (SQLite WAL-style) — many readers + one writer; readers use snapshots and don’t wait on the writer goroutine (same process first)
+- [ ] **Transaction API** — `Begin` / `Commit` / `Rollback` (snapshot reads; writes buffered until commit)
+- [ ] **Multi-process readers** — shared lock for readers, exclusive for writer (full SQLite-WAL process model)
+
+### Reliability
+
+- [ ] Crash/recovery tests, concurrent stress, fuzz, durability docs, format migrations, backup, corruption/verify — treat as one reliability bar for production, not separate engine features
+
+### Later (SQL)
+
+- [ ] **B-tree** (or equivalent) storage for ordered keys / range scans
+- [ ] **Query planner**
+- [ ] **Query engine** — execute plans against the store
+- [ ] **SQL** — parser + bind to the planner/engine
 
 ## Embed
 
