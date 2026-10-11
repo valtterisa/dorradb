@@ -1,4 +1,5 @@
 // Package dorradb is an embedded key-value store with a WAL and checkpoints.
+// File locking uses github.com/gofrs/flock.
 //
 // Open a database file (created if missing):
 //
