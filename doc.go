@@ -16,6 +16,6 @@
 // being applied to the main file.
 //
 // OS I/O goes through an internal VFS (Linux and Windows). File locking uses
-// github.com/gofrs/flock. Seq numbers on records leave room for future MVCC/OCC
+// github.com/gofrs/flock. Seq numbers on records leave room for future MVCC
 // without changing Open.
 package dorradb

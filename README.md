@@ -2,6 +2,10 @@
 
 Embedded key-value store for Go on **Linux and Windows**. One process opens a path; values live on disk; an in-memory index maps keys to offsets. Mutations are group-committed through a WAL, then applied to the main file.
 
+**Outside pull requests are not accepted.** Open an [issue](https://github.com/valtterisa/dorradb/issues) if something is wrong, unclear, or broken — reports and discussion are welcome. Changes land from the maintainer only.
+
+Licensed under [MIT](LICENSE).
+
 OS I/O goes through an internal VFS (stdlib + [`gofrs/flock`](https://github.com/gofrs/flock)). Engine code only sees `vfs.FS`.
 
 ```text
@@ -9,6 +13,12 @@ app.dorradb         # main database (append-only between checkpoints)
 app.dorradb-wal     # write-ahead log
 app.dorradb.lock    # exclusive advisory lock
 ```
+
+## Goals
+
+- [x] One writer at a time, WAL + checkpoint, exclusive file lock
+- [x] Version numbers (`seq`) on every record
+- [ ] **Many readers + one writer at a time** (SQLite WAL-style) — do this with **MVCC** snapshots so `Get` doesn’t wait on the writer
 
 ## Embed
 
@@ -134,3 +144,11 @@ Exit codes: `0` ok, `1` error, `2` key not found (`get`).
 Little-endian frames with IEEE CRC32. Fixed 64-byte header: magic `DORA` (`0x41524F44`), file type (main=1, WAL=2), `formatVersion = 1`, seq, WAL checkpoint offset, header CRC.
 
 Records: length-prefixed payload + CRC. Ops: set (1), delete (2). Newer format versions refuse to open (`ErrUnsupportedVersion`). A torn last record is treated as a crash tail; a CRC failure mid-file is `ErrCorrupt`.
+
+## Contributing
+
+Outside PRs are not accepted. Issues, forks, and self-hosting are fine — see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## License
+
+[MIT](LICENSE) — Copyright (c) 2026 Valtteri Savonen.
