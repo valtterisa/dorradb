@@ -185,7 +185,9 @@ func cmdStatus(db *dorradb.DB, jsonOut bool) int {
 		return ExitOK
 	}
 	fmt.Printf("path=%s\n", s.Path)
-	fmt.Printf("seq=%d\n", s.Seq)
+	fmt.Printf("sequence=%d\n", s.Sequence)
+	fmt.Printf("committed_sequence=%d\n", s.CommittedSequence)
+	fmt.Printf("pinned_readers=%d\n", s.PinnedReaders)
 	fmt.Printf("live_keys=%d\n", s.LiveKeys)
 	fmt.Printf("main_bytes=%d\n", s.MainBytes)
 	fmt.Printf("wal_bytes=%d\n", s.WALBytes)
@@ -260,7 +262,7 @@ func cmdShell(db *dorradb.DB, dbPath string) int {
 			fmt.Println("deleted")
 		case "stats", "status":
 			s := db.Stats()
-			fmt.Printf("keys=%d  seq=%d  main=%d bytes  wal=%d bytes\n", s.LiveKeys, s.Seq, s.MainBytes, s.WALBytes)
+			fmt.Printf("keys=%d  sequence=%d  main=%d bytes  wal=%d bytes\n", s.LiveKeys, s.Sequence, s.MainBytes, s.WALBytes)
 		default:
 			fmt.Fprintf(os.Stderr, "unknown %q — type help\n", cmd)
 		}

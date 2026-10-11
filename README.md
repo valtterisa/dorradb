@@ -19,9 +19,9 @@ app.dorradb.lock    # exclusive advisory lock
 ### Engine
 
 - [x] One writer at a time, WAL + checkpoint, exclusive file lock
-- [x] Version numbers (`seq`) on every record
-- [ ] **MVCC + multi-reader** (SQLite WAL-style) — many readers + one writer; readers use snapshots and don’t wait on the writer goroutine (same process first)
-- [ ] **Transaction API** — `Begin` / `Commit` / `Rollback` (snapshot reads; writes buffered until commit)
+- [x] Version numbers (`sequence`) on every record
+- [x] **MVCC + multi-reader** (SQLite WAL-style) — many readers + one writer; readers use statement snapshots and don’t wait on the writer goroutine (same process)
+- [ ] **Transaction API** — `Begin` / `Commit` / `Rollback` (reuses MVCC pins + visibility; writes buffered until commit)
 - [ ] **Multi-process readers** — shared lock for readers, exclusive for writer (full SQLite-WAL process model)
 
 ### Reliability
@@ -53,15 +53,17 @@ stats := db.Stats()
 
 `Open` creates the database if missing. Only one process may hold the path (`ErrLocked` otherwise). The OS releases the lock on exit or crash.
 
-All methods are safe for concurrent use; mutations run on a single writer loop.
+All methods are safe for concurrent use. Mutations run on a single writer loop.
+`Get` / `Has` take a statement snapshot at the committed sequence (MVCC) and do not
+queue behind the writer.
 
 | Method | Notes |
 | --- | --- |
-| `Get` | Returns a copy of the value, or `ErrNotFound` |
-| `Set` | Create or overwrite; durable after return when WAL sync is on (default) |
+| `Get` | Returns a copy of the value, or `ErrNotFound` (statement snapshot) |
+| `Set` | Create or overwrite; durable and visible after return when WAL sync is on (default) |
 | `Delete` | Missing keys are not an error |
-| `Has` | Existence check without copying the value |
-| `Stats` | Path, seq, live keys, file sizes, approx dead bytes |
+| `Has` | Existence check without copying the value (statement snapshot) |
+| `Stats` | Path, sequence, committed sequence, pinned readers, live keys, file sizes, approx dead bytes |
 | `Close` | Flush, unlock, close files |
 
 ### Options
@@ -89,10 +91,10 @@ db, err := dorradb.Open("app.dorradb", dorradb.Options{
 ### Durability
 
 1. Mutations are **group-committed** to the WAL and fsynced (unless `DisableSync`).
-2. Then appended to the main file, the RAM index is updated, and the call returns.
-3. On open after a crash: scan the main file (ignore a torn last record), then replay WAL records with seq greater than the main file’s max seq.
+2. Then appended to the main file and the RAM version index; then `committedSequence` is published and the call returns.
+3. On open after a crash: scan the main file (ignore a torn last record), then replay WAL records with sequence greater than the main file’s max sequence.
 
-Checkpoints rewrite live keys into a new main file (`*.tmp` → fsync → rename → **fsync parent directory**) and truncate the WAL. By default they run at 8 MiB of WAL growth or after 30s with mutations.
+Checkpoints rewrite live keys into a new main file (`*.tmp` → fsync → rename → **fsync parent directory**) and truncate the WAL. They defer while any reader pin is held. By default they run at 8 MiB of WAL growth or after 30s with mutations.
 
 The main file is append-only between checkpoints, so updates and deletes leave garbage until compact (`Stats.ApproxDeadBytes`).
 
@@ -152,7 +154,7 @@ Exit codes: `0` ok, `1` error, `2` key not found (`get`).
 
 ## On-disk format
 
-Little-endian frames with IEEE CRC32. Fixed 64-byte header: magic `DORA` (`0x41524F44`), file type (main=1, WAL=2), `formatVersion = 1`, seq, WAL checkpoint offset, header CRC.
+Little-endian frames with IEEE CRC32. Fixed 64-byte header: magic `DORA` (`0x41524F44`), file type (main=1, WAL=2), `formatVersion = 1`, sequence, WAL checkpoint offset, header CRC.
 
 Records: length-prefixed payload + CRC. Ops: set (1), delete (2). Newer format versions refuse to open (`ErrUnsupportedVersion`). A torn last record is treated as a crash tail; a CRC failure mid-file is `ErrCorrupt`.
 

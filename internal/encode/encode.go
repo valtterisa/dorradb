@@ -36,7 +36,7 @@ var crcTable = crc32.MakeTable(crc32.IEEE)
 type Header struct {
 	FileType            uint8
 	FormatVersion       uint8
-	Seq                 uint64 // highest seq included in this file (after compact)
+	Sequence            uint64 // highest sequence included in this file (after compact)
 	WalCheckpointOffset uint64 // WAL byte offset where replay should start
 }
 
@@ -62,7 +62,7 @@ func EncodeHeader(h Header) []byte {
 	binary.LittleEndian.PutUint32(buf[0:4], Magic)
 	buf[4] = h.FileType
 	buf[5] = h.FormatVersion
-	binary.LittleEndian.PutUint64(buf[8:16], h.Seq)
+	binary.LittleEndian.PutUint64(buf[8:16], h.Sequence)
 	binary.LittleEndian.PutUint64(buf[16:24], h.WalCheckpointOffset)
 	sum := CRC(buf[:HeaderSize-4])
 	binary.LittleEndian.PutUint32(buf[HeaderSize-4:], sum)
@@ -83,7 +83,7 @@ func DecodeHeader(buf []byte) (Header, error) {
 	h := Header{
 		FileType:            buf[4],
 		FormatVersion:       buf[5],
-		Seq:                 binary.LittleEndian.Uint64(buf[8:16]),
+		Sequence:            binary.LittleEndian.Uint64(buf[8:16]),
 		WalCheckpointOffset: binary.LittleEndian.Uint64(buf[16:24]),
 	}
 	// Version gate: refuse anything we don't understand.
@@ -95,19 +95,19 @@ func DecodeHeader(buf []byte) (Header, error) {
 
 // Record is one logical mutation (also what we store in the main data file).
 type Record struct {
-	Seq   uint64 // monotonic commit/version number (hook for future MVCC)
-	Op    uint8
-	Key   []byte
-	Value []byte // empty for Delete
+	Sequence uint64 // monotonic logical commit/version number (MVCC write stamp)
+	Op       uint8
+	Key      []byte
+	Value    []byte // empty for Delete
 }
 
-// Payload layout: seq u64 | op u8 | keyLen u32 | key | valLen u32 | value
+// Payload layout: sequence u64 | op u8 | keyLen u32 | key | valLen u32 | value
 func EncodePayload(r Record) []byte {
 	keyLen := uint32(len(r.Key))
 	valLen := uint32(len(r.Value))
 	n := 8 + 1 + 4 + len(r.Key) + 4 + len(r.Value)
 	buf := make([]byte, 0, n)
-	buf = AppendU64(buf, r.Seq)
+	buf = AppendU64(buf, r.Sequence)
 	buf = append(buf, r.Op)
 	buf = AppendU32(buf, keyLen)
 	buf = append(buf, r.Key...)
@@ -120,7 +120,7 @@ func DecodePayload(p []byte) (Record, error) {
 	if len(p) < 8+1+4+4 {
 		return Record{}, ErrShort
 	}
-	r := Record{Seq: binary.LittleEndian.Uint64(p[0:8]), Op: p[8]}
+	r := Record{Sequence: binary.LittleEndian.Uint64(p[0:8]), Op: p[8]}
 	off := 9
 	if off+4 > len(p) {
 		return Record{}, ErrShort
@@ -189,7 +189,7 @@ func DecodeFrameAt(data []byte, fileOff int64) (FrameView, int, error) {
 	if err != nil {
 		return FrameView{}, 0, err
 	}
-	// value starts after seq+op+keyLen+key+valLen inside the payload.
+	// value starts after sequence+op+keyLen+key+valLen inside the payload.
 	valueOffInPayload := 8 + 1 + 4 + len(rec.Key) + 4
 	fv := FrameView{
 		Record:     rec,

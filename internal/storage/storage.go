@@ -51,7 +51,7 @@ func Open(fs vfs.FS, dbPath string, create bool) (*Main, error) {
 		h := encode.Header{
 			FileType:            encode.FileTypeMain,
 			FormatVersion:       encode.FormatVersion,
-			Seq:                 0,
+			Sequence:            0,
 			WalCheckpointOffset: encode.HeaderSize,
 		}
 		if _, err := f.Write(encode.EncodeHeader(h)); err != nil {
@@ -119,7 +119,7 @@ func (m *Main) Append(rec encode.Record) (index.Loc, error) {
 		Length:   fv.Length,
 		ValueOff: fv.ValueOff,
 		ValueLen: fv.ValueLen,
-		Seq:      rec.Seq,
+		Sequence: rec.Sequence,
 		Deleted:  rec.Op == encode.OpDelete,
 	}
 	return loc, nil
@@ -173,7 +173,7 @@ func (m *Main) ScanIndex(idx *index.Index) error {
 			Length:   fv.Length,
 			ValueOff: fv.ValueOff,
 			ValueLen: fv.ValueLen,
-			Seq:      fv.Record.Seq,
+			Sequence: fv.Record.Sequence,
 			Deleted:  fv.Record.Op == encode.OpDelete,
 		}
 		idx.Apply(fv.Record.Key, loc)

@@ -13,8 +13,9 @@ const (
 	maxValueBytes = 4 << 20 // 4 MiB
 )
 
-// DB is the public handle. All methods are safe to call from multiple goroutines;
-// the engine serializes mutations on one writer loop.
+// DB is the public handle. All methods are safe to call from multiple goroutines.
+// Mutations run on a single writer loop; Get/Has use MVCC statement snapshots and
+// do not wait on that loop.
 type DB struct {
 	eng *engine.Engine
 }
@@ -84,12 +85,14 @@ func (db *DB) Has(key []byte) (bool, error) {
 func (db *DB) Stats() Stats {
 	s := db.eng.Stats()
 	return Stats{
-		Path:            s.Path,
-		Seq:             s.Seq,
-		LiveKeys:        s.LiveKeys,
-		MainBytes:       s.MainBytes,
-		WALBytes:        s.WALBytes,
-		ApproxDeadBytes: s.ApproxDeadBytes,
+		Path:              s.Path,
+		Sequence:          s.Sequence,
+		CommittedSequence: s.CommittedSequence,
+		PinnedReaders:     s.PinnedReaders,
+		LiveKeys:          s.LiveKeys,
+		MainBytes:         s.MainBytes,
+		WALBytes:          s.WALBytes,
+		ApproxDeadBytes:   s.ApproxDeadBytes,
 	}
 }
 

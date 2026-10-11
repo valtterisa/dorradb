@@ -1,18 +1,21 @@
-// Package engine is the single-writer core of DoraDB.
+// Package engine is the single-writer core of DoraDB with same-process MVCC reads.
 //
 // Write path (Set/Delete):
 //  1. queue request to the writer goroutine
 //  2. group-commit: append several WAL records, one Sync
 //  3. append same records to main file + update RAM index
-//  4. reply OK
-//  5. maybe checkpoint (WAL size or time)
+//  4. publish committedSequence, reply OK
+//  5. maybe checkpoint (WAL size or time) if no reader pins
 //
-// Recovery on Open: scan main → replay WAL records with seq > main max seq.
+// Read path (Get/Has): pin committedSequence, GetVisible, ReadAt — does not wait on writer.
+//
+// Recovery on Open: scan main → replay WAL records with sequence > main max sequence.
 package engine
 
 import (
 	"errors"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -24,21 +27,21 @@ import (
 )
 
 type Stats struct {
-	Path            string
-	Seq             uint64
-	LiveKeys        int
-	MainBytes       int64
-	WALBytes        int64
-	ApproxDeadBytes int64
-	LastCheckpoint  time.Time
+	Path              string
+	Sequence          uint64
+	CommittedSequence uint64
+	PinnedReaders     int
+	LiveKeys          int
+	MainBytes         int64
+	WALBytes          int64
+	ApproxDeadBytes   int64
+	LastCheckpoint    time.Time
 }
 
 type opKind int
 
 const (
-	opGet opKind = iota
-	opHas
-	opSet
+	opSet opKind = iota
 	opDelete
 	opStats
 	opClose
@@ -52,8 +55,6 @@ type request struct {
 }
 
 type reply struct {
-	value []byte
-	has   bool
 	stats Stats
 	err   error
 }
@@ -68,13 +69,19 @@ type Engine struct {
 	idx  *index.Index
 	opts Options
 
-	seq                uint64 // next mutation gets seq+1
+	sequence           uint64 // next mutation gets sequence+1 (writer-only)
+	committedSequence  atomic.Uint64
 	walBytesSinceCkpt  int64
 	lastCheckpoint     time.Time
 	mutationsSinceCkpt bool
 	ckptInFlight       bool
 
-	reqCh  chan request // all API calls enqueue here
+	pinMu    sync.Mutex
+	pinCond  *sync.Cond
+	pins     map[uint64]int // snapshotSequence → refcount
+	pinCount int
+
+	reqCh  chan request // mutations / stats / close
 	closed atomic.Bool
 	done   chan struct{} // closed when writer loop exits
 }
@@ -126,9 +133,11 @@ func Open(path string, opts Options) (*Engine, error) {
 		idx:            index.New(),
 		opts:           opts,
 		lastCheckpoint: time.Now(),
+		pins:           make(map[uint64]int),
 		reqCh:          make(chan request, 256),
 		done:           make(chan struct{}),
 	}
+	e.pinCond = sync.NewCond(&e.pinMu)
 
 	if err := e.recover(); err != nil {
 		e.cleanup()
@@ -139,16 +148,16 @@ func Open(path string, opts Options) (*Engine, error) {
 	return e, nil
 }
 
-// recover: load index from main, then replay WAL for seqs not yet on main.
+// recover: load index from main, then replay WAL for sequences not yet on main.
 func (e *Engine) recover() error {
 	if err := e.main.ScanIndex(e.idx); err != nil {
 		return err
 	}
-	maxMainSeq := e.idx.MaxSeq()
-	if hseq := e.main.Header().Seq; hseq > maxMainSeq {
-		maxMainSeq = hseq
+	maxMainSequence := e.idx.MaxSequence()
+	if hseq := e.main.Header().Sequence; hseq > maxMainSequence {
+		maxMainSequence = hseq
 	}
-	e.seq = maxMainSeq
+	e.sequence = maxMainSequence
 
 	from := int64(e.main.Header().WalCheckpointOffset)
 	if from < encode.HeaderSize {
@@ -156,10 +165,10 @@ func (e *Engine) recover() error {
 	}
 	err := e.log.Replay(from, func(fv encode.FrameView) error {
 		rec := fv.Record
-		if rec.Seq > e.seq {
-			e.seq = rec.Seq
+		if rec.Sequence > e.sequence {
+			e.sequence = rec.Sequence
 		}
-		if rec.Seq <= maxMainSeq {
+		if rec.Sequence <= maxMainSequence {
 			return nil
 		}
 		loc, aerr := e.main.Append(rec)
@@ -172,6 +181,7 @@ func (e *Engine) recover() error {
 	if err != nil {
 		return err
 	}
+	e.committedSequence.Store(e.sequence)
 	e.walBytesSinceCkpt = e.log.Size() - encode.HeaderSize
 	if e.walBytesSinceCkpt < 0 {
 		e.walBytesSinceCkpt = 0
@@ -191,7 +201,55 @@ func (e *Engine) cleanup() {
 	}
 }
 
-// loop is the only goroutine that mutates index/main/WAL.
+// Pin holds a snapshot so compact will not reclaim Locs the reader still needs.
+// Returns false if the engine is closed. Exported for a future Transaction API.
+func (e *Engine) Pin(sequence uint64) bool {
+	e.pinMu.Lock()
+	defer e.pinMu.Unlock()
+	if e.closed.Load() {
+		return false
+	}
+	e.pins[sequence]++
+	e.pinCount++
+	return true
+}
+
+// Unpin releases a Pin. Exported for a future Transaction API.
+func (e *Engine) Unpin(sequence uint64) {
+	e.pinMu.Lock()
+	defer e.pinMu.Unlock()
+	n := e.pins[sequence]
+	if n <= 1 {
+		delete(e.pins, sequence)
+	} else {
+		e.pins[sequence] = n - 1
+	}
+	e.pinCount--
+	if e.pinCount == 0 {
+		e.pinCond.Broadcast()
+	}
+}
+
+// CommittedSequence is the last sequence fully published to readers.
+func (e *Engine) CommittedSequence() uint64 {
+	return e.committedSequence.Load()
+}
+
+func (e *Engine) pinnedReaderCount() int {
+	e.pinMu.Lock()
+	defer e.pinMu.Unlock()
+	return e.pinCount
+}
+
+func (e *Engine) waitPins() {
+	e.pinMu.Lock()
+	for e.pinCount > 0 {
+		e.pinCond.Wait()
+	}
+	e.pinMu.Unlock()
+}
+
+// loop is the only goroutine that mutates index/main/WAL (aside from index RLock reads).
 func (e *Engine) loop() {
 	defer close(e.done)
 	for {
@@ -203,35 +261,12 @@ func (e *Engine) loop() {
 		case opClose:
 			e.finishClose(req)
 			return
-		case opGet:
-			e.handleGet(req)
-		case opHas:
-			e.handleHas(req)
 		case opStats:
 			e.handleStats(req)
 		case opSet, opDelete:
 			e.handleMutations(req)
 		}
 	}
-}
-
-func (e *Engine) handleGet(req request) {
-	loc, ok := e.idx.Get(req.key)
-	if !ok || loc.Deleted {
-		req.reply <- reply{err: ErrNotFound}
-		return
-	}
-	val, err := e.main.ReadValue(loc)
-	if err != nil {
-		req.reply <- reply{err: err}
-		return
-	}
-	req.reply <- reply{value: append([]byte(nil), val...)}
-}
-
-func (e *Engine) handleHas(req request) {
-	loc, ok := e.idx.Get(req.key)
-	req.reply <- reply{has: ok && !loc.Deleted}
 }
 
 func (e *Engine) handleStats(req request) {
@@ -242,13 +277,15 @@ func (e *Engine) handleStats(req request) {
 		dead = 0
 	}
 	req.reply <- reply{stats: Stats{
-		Path:            e.path,
-		Seq:             e.seq,
-		LiveKeys:        e.idx.LiveCount(),
-		MainBytes:       mainSize,
-		WALBytes:        e.log.Size(),
-		ApproxDeadBytes: dead,
-		LastCheckpoint:  e.lastCheckpoint,
+		Path:              e.path,
+		Sequence:          e.sequence,
+		CommittedSequence: e.committedSequence.Load(),
+		PinnedReaders:     e.pinnedReaderCount(),
+		LiveKeys:          e.idx.LiveCount(),
+		MainBytes:         mainSize,
+		WALBytes:          e.log.Size(),
+		ApproxDeadBytes:   dead,
+		LastCheckpoint:    e.lastCheckpoint,
 	}}
 }
 
@@ -273,10 +310,6 @@ gather:
 				e.applyGroup(group)
 				e.finishClose(req)
 				return
-			case opGet:
-				e.handleGet(req)
-			case opHas:
-				e.handleHas(req)
 			case opStats:
 				e.handleStats(req)
 			}
@@ -288,7 +321,7 @@ gather:
 	e.maybeCheckpoint()
 }
 
-// applyGroup: WAL append all → Sync once → apply to main + index → ack.
+// applyGroup: WAL append all → Sync once → main + index → publish committedSequence → ack.
 // If Sync fails, nothing is applied to main (WAL may still have bytes on disk).
 func (e *Engine) applyGroup(group []request) {
 	if len(group) == 0 {
@@ -301,8 +334,8 @@ func (e *Engine) applyGroup(group []request) {
 	}
 	items := make([]prepared, 0, len(group))
 	for _, req := range group {
-		e.seq++
-		rec := encode.Record{Seq: e.seq, Key: req.key}
+		e.sequence++
+		rec := encode.Record{Sequence: e.sequence, Key: req.key}
 		if req.kind == opSet {
 			rec.Op = encode.OpSet
 			rec.Value = req.value
@@ -326,16 +359,30 @@ func (e *Engine) applyGroup(group []request) {
 			return
 		}
 	}
+
+	type result struct {
+		req request
+		err error
+	}
+	results := make([]result, 0, len(items))
+	var appliedHigh uint64
 	for _, it := range items {
 		loc, err := e.main.Append(it.rec)
 		if err != nil {
-			it.req.reply <- reply{err: err}
+			results = append(results, result{req: it.req, err: err})
 			continue
 		}
 		e.idx.Apply(it.rec.Key, loc)
+		appliedHigh = it.rec.Sequence
 		e.walBytesSinceCkpt += it.frameLen
 		e.mutationsSinceCkpt = true
-		it.req.reply <- reply{}
+		results = append(results, result{req: it.req})
+	}
+	if appliedHigh > 0 {
+		e.committedSequence.Store(appliedHigh)
+	}
+	for _, r := range results {
+		r.req.reply <- reply{err: r.err}
 	}
 }
 
@@ -352,9 +399,23 @@ func (e *Engine) maybeCheckpoint() {
 }
 
 // compact rewrites only live keys into *.tmp, renames over main, truncates WAL.
+// Deferred while any reader pin is held (Loc offsets would become invalid).
 func (e *Engine) compact() error {
+	if e.pinnedReaderCount() > 0 {
+		return nil
+	}
+
 	e.ckptInFlight = true
 	defer func() { e.ckptInFlight = false }()
+
+	// Re-check under pinMu so a pin cannot slip in after the count check and
+	// before we replace the main file. Writers own the loop; readers only pin.
+	e.pinMu.Lock()
+	if e.pinCount > 0 {
+		e.pinMu.Unlock()
+		return nil
+	}
+	e.pinMu.Unlock()
 
 	var records []encode.Record
 	err := e.idx.ForEachLive(func(key string, loc index.Loc) error {
@@ -363,10 +424,10 @@ func (e *Engine) compact() error {
 			return err
 		}
 		records = append(records, encode.Record{
-			Seq:   loc.Seq,
-			Op:    encode.OpSet,
-			Key:   []byte(key),
-			Value: val,
+			Sequence: loc.Sequence,
+			Op:       encode.OpSet,
+			Key:      []byte(key),
+			Value:    val,
 		})
 		return nil
 	})
@@ -378,7 +439,7 @@ func (e *Engine) compact() error {
 	h := encode.Header{
 		FileType:            encode.FileTypeMain,
 		FormatVersion:       encode.FormatVersion,
-		Seq:                 e.seq,
+		Sequence:            e.sequence,
 		WalCheckpointOffset: encode.HeaderSize,
 	}
 	newSize, err := storage.WriteCompactFile(e.fs, tmp, h, records)
@@ -386,24 +447,37 @@ func (e *Engine) compact() error {
 		_ = e.fs.Remove(tmp)
 		return err
 	}
+
+	// Hold pinMu through replace + rescan so no reader can observe stale Locs.
+	e.pinMu.Lock()
+	if e.pinCount > 0 {
+		e.pinMu.Unlock()
+		_ = e.fs.Remove(tmp)
+		return nil
+	}
 	if err := e.main.ReplaceWithCompact(tmp, h, newSize); err != nil {
+		e.pinMu.Unlock()
 		_ = e.fs.Remove(tmp)
 		return err
 	}
 	if err := e.log.TruncateReset(); err != nil {
+		e.pinMu.Unlock()
 		return err
 	}
 	if err := e.main.ScanIndex(e.idx); err != nil {
+		e.pinMu.Unlock()
 		return err
 	}
 	e.walBytesSinceCkpt = 0
 	e.mutationsSinceCkpt = false
 	e.lastCheckpoint = time.Now()
+	e.pinMu.Unlock()
 	return nil
 }
 
 func (e *Engine) finishClose(req request) {
 	e.closed.Store(true)
+	e.waitPins()
 	_ = e.log.Sync()
 	err1 := e.log.Close()
 	err2 := e.main.Close()
@@ -435,17 +509,50 @@ func (e *Engine) call(req request) reply {
 	}
 }
 
+// Get reads a statement snapshot at committedSequence without joining the writer queue.
 func (e *Engine) Get(key []byte) ([]byte, error) {
-	r := e.call(request{kind: opGet, key: key})
-	if r.err != nil {
-		return nil, r.err
-	}
-	return r.value, nil
+	return e.GetAt(key, e.committedSequence.Load())
 }
 
+// GetAt returns the value visible at snapshotSequence. Pins for the call duration
+// (a future Tx can hold an additional long-lived Pin on the same sequence).
+func (e *Engine) GetAt(key []byte, snapshotSequence uint64) ([]byte, error) {
+	if e.closed.Load() {
+		return nil, ErrClosed
+	}
+	if !e.Pin(snapshotSequence) {
+		return nil, ErrClosed
+	}
+	defer e.Unpin(snapshotSequence)
+
+	loc, ok := e.idx.GetVisible(key, snapshotSequence)
+	if !ok {
+		return nil, ErrNotFound
+	}
+	val, err := e.main.ReadValue(loc)
+	if err != nil {
+		return nil, err
+	}
+	return append([]byte(nil), val...), nil
+}
+
+// Has is a statement-snapshot existence check (same path as Get).
 func (e *Engine) Has(key []byte) (bool, error) {
-	r := e.call(request{kind: opHas, key: key})
-	return r.has, r.err
+	return e.HasAt(key, e.committedSequence.Load())
+}
+
+// HasAt reports whether key exists at snapshotSequence.
+func (e *Engine) HasAt(key []byte, snapshotSequence uint64) (bool, error) {
+	if e.closed.Load() {
+		return false, ErrClosed
+	}
+	if !e.Pin(snapshotSequence) {
+		return false, ErrClosed
+	}
+	defer e.Unpin(snapshotSequence)
+
+	_, ok := e.idx.GetVisible(key, snapshotSequence)
+	return ok, nil
 }
 
 func (e *Engine) Set(key, value []byte) error {

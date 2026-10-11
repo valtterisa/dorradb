@@ -1,6 +1,8 @@
-// Package index is the in-RAM map from key → where the value lives on disk.
+// Package index is the in-RAM map from key → version chain of on-disk Locs.
 // Values themselves stay in the main file; we only store offsets here.
 package index
+
+import "sync"
 
 // Loc points at one record in the main *.dorradb file.
 type Loc struct {
@@ -8,47 +10,82 @@ type Loc struct {
 	Length   int64 // full frame length
 	ValueOff int64 // where the value bytes start (for ReadAt)
 	ValueLen int
-	Seq      uint64 // version of this entry
+	Sequence uint64 // logical version of this entry
 	Deleted  bool   // tombstone until the next compact
 }
 
-// Index is key → latest Loc. Not safe for concurrent use without external sync
-// (the engine writer loop owns it).
+// version is one link in a newest-first chain.
+type version struct {
+	loc  Loc
+	prev *version // older version
+}
+
+// Index is key → newest version (chain of older Locs). Safe for concurrent
+// readers via RLock; writers take Lock on Apply/prune.
 type Index struct {
-	m map[string]Loc
+	mu sync.RWMutex
+	m  map[string]*version
 }
 
 func New() *Index {
-	return &Index{m: make(map[string]Loc)}
+	return &Index{m: make(map[string]*version)}
 }
 
+// Get returns the newest Loc for key (not snapshot-aware).
 func (idx *Index) Get(key []byte) (Loc, bool) {
-	loc, ok := idx.m[string(key)]
-	return loc, ok
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	v := idx.m[string(key)]
+	if v == nil {
+		return Loc{}, false
+	}
+	return v.loc, true
+}
+
+// GetVisible returns the newest Loc with Sequence <= snapshotSequence.
+// If that Loc is a tombstone, ok is false.
+func (idx *Index) GetVisible(key []byte, snapshotSequence uint64) (Loc, bool) {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	for v := idx.m[string(key)]; v != nil; v = v.prev {
+		if v.loc.Sequence > snapshotSequence {
+			continue
+		}
+		if v.loc.Deleted {
+			return Loc{}, false
+		}
+		return v.loc, true
+	}
+	return Loc{}, false
 }
 
 func (idx *Index) Put(key []byte, loc Loc) {
-	idx.m[string(key)] = loc
+	idx.Apply(key, loc)
 }
 
-func (idx *Index) Delete(key []byte, seq uint64) {
-	idx.m[string(key)] = Loc{Seq: seq, Deleted: true}
+func (idx *Index) Delete(key []byte, sequence uint64) {
+	idx.Apply(key, Loc{Sequence: sequence, Deleted: true})
 }
 
-// Apply keeps the Loc with the highest seq (needed when replaying WAL after
-// some records may already be on the main file).
+// Apply pushes a newer Loc onto the version chain. Ignores Locs that are not
+// strictly newer than the current head (recovery / replay safety).
 func (idx *Index) Apply(key []byte, loc Loc) {
-	prev, ok := idx.m[string(key)]
-	if ok && prev.Seq > loc.Seq {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	k := string(key)
+	head := idx.m[k]
+	if head != nil && head.loc.Sequence >= loc.Sequence {
 		return
 	}
-	idx.m[string(key)] = loc
+	idx.m[k] = &version{loc: loc, prev: head}
 }
 
 func (idx *Index) LiveCount() int {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
 	n := 0
-	for _, loc := range idx.m {
-		if !loc.Deleted {
+	for _, v := range idx.m {
+		if v != nil && !v.loc.Deleted {
 			n++
 		}
 	}
@@ -56,37 +93,77 @@ func (idx *Index) LiveCount() int {
 }
 
 func (idx *Index) ApproxLiveBytes() int64 {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
 	var n int64
-	for _, loc := range idx.m {
-		if !loc.Deleted {
-			n += loc.Length
+	for _, v := range idx.m {
+		if v != nil && !v.loc.Deleted {
+			n += v.loc.Length
 		}
 	}
 	return n
 }
 
-// ForEachLive visits non-deleted keys (used when building a checkpoint).
+// ForEachLive visits newest non-deleted keys (used when building a checkpoint).
 func (idx *Index) ForEachLive(fn func(key string, loc Loc) error) error {
-	for k, loc := range idx.m {
-		if loc.Deleted {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	for k, v := range idx.m {
+		if v == nil || v.loc.Deleted {
 			continue
 		}
-		if err := fn(k, loc); err != nil {
+		if err := fn(k, v.loc); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (idx *Index) Reset() {
-	idx.m = make(map[string]Loc)
+// Prune drops versions older than the Loc visible at horizon (keeps that Loc
+// and everything newer). Safe when no reader can pin below horizon.
+func (idx *Index) Prune(horizon uint64) {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	for k, head := range idx.m {
+		var visible *version
+		for v := head; v != nil; v = v.prev {
+			if v.loc.Sequence <= horizon {
+				visible = v
+				break
+			}
+		}
+		if visible == nil {
+			delete(idx.m, k)
+			continue
+		}
+		// Collect versions newer than visible (newest-first order from head).
+		var newer []Loc
+		for v := head; v != visible; v = v.prev {
+			newer = append(newer, v.loc)
+		}
+		newHead := &version{loc: visible.loc, prev: nil}
+		for i := len(newer) - 1; i >= 0; i-- {
+			newHead = &version{loc: newer[i], prev: newHead}
+		}
+		idx.m[k] = newHead
+	}
 }
 
-func (idx *Index) MaxSeq() uint64 {
+func (idx *Index) Reset() {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	idx.m = make(map[string]*version)
+}
+
+func (idx *Index) MaxSequence() uint64 {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
 	var max uint64
-	for _, loc := range idx.m {
-		if loc.Seq > max {
-			max = loc.Seq
+	for _, head := range idx.m {
+		for v := head; v != nil; v = v.prev {
+			if v.loc.Sequence > max {
+				max = v.loc.Sequence
+			}
 		}
 	}
 	return max
