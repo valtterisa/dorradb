@@ -1,14 +1,14 @@
 # DorraDB
 
-Embedded key-value library for Go (**Linux and Windows**). SQLite-style files, with OS differences behind an internal **VFS** (stdlib + [`gofrs/flock`](https://github.com/gofrs/flock)):
+Embedded key-value store for Go on **Linux and Windows**. One process opens a path; values live on disk; an in-memory index maps keys to offsets. Mutations are group-committed through a WAL, then applied to the main file.
+
+OS I/O goes through an internal VFS (stdlib + [`gofrs/flock`](https://github.com/gofrs/flock)). Engine code only sees `vfs.FS`.
 
 ```text
-app.dorradb         # main database
+app.dorradb         # main database (append-only between checkpoints)
 app.dorradb-wal     # write-ahead log
-app.dorradb.lock    # exclusive advisory lock (via gofrs/flock)
+app.dorradb.lock    # exclusive advisory lock
 ```
-
-Engine code talks to `vfs.FS` only. The default OS VFS maps that to native open/read/write/sync/rename and platform directory sync after checkpoint rename.
 
 ## Embed
 
@@ -19,22 +19,37 @@ if err != nil {
 }
 defer db.Close()
 
-_ = db.Set([]byte("k"), []byte("v"))
-v, err := db.Get([]byte("k"))
-_ = db.Delete([]byte("k"))
+err = db.Set([]byte("user:1"), []byte(`{"name":"Ada"}`))
+val, err := db.Get([]byte("user:1"))
+ok, err := db.Has([]byte("user:1"))
+err = db.Delete([]byte("user:1"))
+err = db.Checkpoint(context.Background())
+stats := db.Stats()
 ```
 
-`Open` creates the database if it does not exist. Only one process may open a given path at a time (`ErrLocked` if another process holds the advisory lock). The OS releases the lock when the process exits or crashes.
+`Open` creates the database if missing. Only one process may hold the path (`ErrLocked` otherwise). The OS releases the lock on exit or crash.
+
+All methods are safe for concurrent use; mutations run on a single writer loop.
+
+| Method | Notes |
+| --- | --- |
+| `Get` | Returns a copy of the value, or `ErrNotFound` |
+| `Set` | Create or overwrite; durable after return when WAL sync is on (default) |
+| `Delete` | Missing keys are not an error |
+| `Has` | Existence check without copying the value |
+| `Checkpoint` | Compact live keys into the main file and truncate the WAL |
+| `Stats` | Path, seq, live keys, file sizes, approx dead bytes, last checkpoint |
+| `Close` | Flush, unlock, close files |
 
 ### Options
 
-Pass an optional `Options` to tune durability and checkpoints. Zero fields keep defaults (`DefaultOptions`):
+Pass an optional `Options` to tune durability and checkpoints. Zero fields keep `DefaultOptions`:
 
 ```go
 db, err := dorradb.Open("app.dorradb", dorradb.Options{
-    WALCheckpointBytes:    32 << 20,       // checkpoint after 32 MiB of WAL growth
+    WALCheckpointBytes:    32 << 20,
     WALCheckpointInterval: 60 * time.Second,
-    DisableSync:           true,           // skip WAL fsync (faster, less durable)
+    DisableSync:           true, // skip WAL fsync (faster, less durable)
     GroupCommitMaxOps:     128,
     GroupCommitMaxWait:    5 * time.Millisecond,
 })
@@ -51,27 +66,39 @@ db, err := dorradb.Open("app.dorradb", dorradb.Options{
 ### Durability
 
 1. Mutations are **group-committed** to the WAL and fsynced (unless `DisableSync`).
-2. Then applied to the main file and acknowledged.
-3. On crash, recovery scans the main file (ignoring a torn tail) and replays WAL records with seq greater than the main file’s max seq.
+2. Then appended to the main file, the RAM index is updated, and the call returns.
+3. On open after a crash: scan the main file (ignore a torn last record), then replay WAL records with seq greater than the main file’s max seq.
 
-Checkpoints compact live keys into a new main file (`*.tmp` → fsync → rename → **fsync parent directory**) and truncate the WAL. By default they run when WAL growth reaches 8 MiB or 30s have passed with mutations (see Options).
+Checkpoints rewrite live keys into a new main file (`*.tmp` → fsync → rename → **fsync parent directory**) and truncate the WAL. By default they run at 8 MiB of WAL growth or after 30s with mutations.
 
-The main file is append-only between checkpoints, so repeated updates of the same key leave garbage until compact (`Stats.ApproxDeadBytes`).
+The main file is append-only between checkpoints, so updates and deletes leave garbage until compact (`Stats.ApproxDeadBytes`).
+
+### Errors
+
+Check with `errors.Is`:
+
+| Error | When |
+| --- | --- |
+| `ErrNotFound` | `Get` on a missing key |
+| `ErrInvalidKey` | Empty key |
+| `ErrTooLarge` | Key > 1 KiB or value > 4 MiB |
+| `ErrLocked` | Another process holds the advisory lock |
+| `ErrClosed` | Use after `Close` |
+| `ErrCorrupt` | Bad magic, mid-file CRC failure, etc. |
+| `ErrUnsupportedVersion` | On-disk `formatVersion` newer than this build |
 
 ### Limits
 
-- Max key: 1 KiB
-- Max value: 4 MiB
+- Key: 1–1024 bytes (empty keys rejected)
+- Value: up to 4 MiB
 
 ## CLI
 
-Easiest — interactive shell on `./app.dorradb`:
+Interactive shell on `./app.dorradb`:
 
 ```bash
 go run ./cmd/dorradb
 ```
-
-Then:
 
 ```text
 dorradb> set name Ada
@@ -80,13 +107,30 @@ dorradb> get name
 Ada
 dorradb> del name
 deleted
+dorradb> stats
+dorradb> compact
 dorradb> quit
 ```
 
-Optional: `go run ./cmd/dorradb --db my.db` or one-shot `go run ./cmd/dorradb get name`.
+Path: `--db PATH`, `--db=PATH`, or env `DORRADB_PATH` (default `./app.dorradb`).
+
+One-shot:
+
+```bash
+go run ./cmd/dorradb set name Ada
+go run ./cmd/dorradb get name
+go run ./cmd/dorradb delete name
+go run ./cmd/dorradb status
+go run ./cmd/dorradb checkpoint
+go run ./cmd/dorradb set blob -   # value from stdin
+```
+
+`--json` formats `get` / `status` as JSON. `version` prints `dorradb 0.1.0`.
 
 Exit codes: `0` ok, `1` error, `2` key not found (`get`).
 
-## Format
+## On-disk format
 
-Little-endian frames with CRC32. Header magic `DORA`, `formatVersion = 1`. Newer versions refuse to open (`ErrUnsupportedVersion`). Mid-file CRC failures return `ErrCorrupt`; a torn last record is treated as a crash tail.
+Little-endian frames with IEEE CRC32. Fixed 64-byte header: magic `DORA` (`0x41524F44`), file type (main=1, WAL=2), `formatVersion = 1`, seq, WAL checkpoint offset, header CRC.
+
+Records: length-prefixed payload + CRC. Ops: set (1), delete (2). Newer format versions refuse to open (`ErrUnsupportedVersion`). A torn last record is treated as a crash tail; a CRC failure mid-file is `ErrCorrupt`.
