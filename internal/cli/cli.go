@@ -19,13 +19,15 @@ const (
 	ExitOK       = 0
 	ExitError    = 1
 	ExitNotFound = 2 // get: key missing
+
+	defaultDBPath = "app.dorradb"
 )
 
 // Run parses flags/subcommand and returns a process exit code.
+// No args → opens interactive shell on ./app.dorradb (easiest path).
 func Run(args []string) int {
 	var dbPath string
 	var jsonOut bool
-	var verbose bool
 	rest := make([]string, 0, len(args))
 	for i := 0; i < len(args); i++ {
 		a := args[i]
@@ -38,7 +40,10 @@ func Run(args []string) int {
 		case a == "--json":
 			jsonOut = true
 		case a == "-v" || a == "--verbose":
-			verbose = true
+			// reserved
+		case a == "-h" || a == "--help" || a == "help":
+			printUsage()
+			return ExitOK
 		default:
 			rest = append(rest, a)
 		}
@@ -46,25 +51,28 @@ func Run(args []string) int {
 	if dbPath == "" {
 		dbPath = os.Getenv("DORRADB_PATH")
 	}
-	if len(rest) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: dorradb [--db path] <command> ...")
-		return ExitError
+	if dbPath == "" {
+		dbPath = defaultDBPath
 	}
-	cmd := rest[0]
-	cmdArgs := rest[1:]
-	_ = verbose
 
-	switch cmd {
-	case "version":
+	// Bare invocation: go run ./cmd/dorradb  →  shell
+	cmd := "shell"
+	cmdArgs := []string(nil)
+	if len(rest) > 0 {
+		cmd = rest[0]
+		cmdArgs = rest[1:]
+	}
+
+	if cmd == "version" {
 		fmt.Println("dorradb 0.1.0")
 		return ExitOK
+	}
+
+	switch cmd {
 	case "set", "get", "delete", "status", "checkpoint", "shell":
-		if dbPath == "" {
-			fmt.Fprintln(os.Stderr, "error: --db or DORRADB_PATH required")
-			return ExitError
-		}
 	default:
-		fmt.Fprintf(os.Stderr, "unknown command: %s\n", cmd)
+		fmt.Fprintf(os.Stderr, "unknown command %q — try: go run ./cmd/dorradb\n", cmd)
+		printUsage()
 		return ExitError
 	}
 
@@ -91,9 +99,29 @@ func Run(args []string) int {
 		}
 		return ExitOK
 	case "shell":
-		return cmdShell(db)
+		return cmdShell(db, dbPath)
 	}
 	return ExitError
+}
+
+func printUsage() {
+	fmt.Fprintf(os.Stderr, `dorradb — embedded KV CLI
+
+  go run ./cmd/dorradb              interactive shell (uses ./app.dorradb)
+  go run ./cmd/dorradb --db my.db   shell on another file
+
+Inside the shell (lowercase is fine):
+  set name Ada
+  get name
+  del name
+  stats
+  help
+  quit
+
+One-shot (optional):
+  go run ./cmd/dorradb get name
+  go run ./cmd/dorradb set name Ada
+`)
 }
 
 func cmdSet(db *dorradb.DB, args []string) int {
@@ -174,11 +202,16 @@ func cmdStatus(db *dorradb.DB, jsonOut bool) int {
 	return ExitOK
 }
 
-func cmdShell(db *dorradb.DB) int {
+func cmdShell(db *dorradb.DB, dbPath string) int {
 	in := bufio.NewScanner(os.Stdin)
-	fmt.Fprintln(os.Stderr, "dorradb shell — GET/SET/DELETE/STATS/CHECKPOINT/QUIT")
+	fmt.Fprintf(os.Stderr, "Opened %s\n", dbPath)
+	fmt.Fprintln(os.Stderr, `Type help for commands. Examples:
+  set name Ada
+  get name
+  del name
+  quit`)
 	for {
-		fmt.Fprint(os.Stderr, "> ")
+		fmt.Fprint(os.Stderr, "dorradb> ")
 		if !in.Scan() {
 			break
 		}
@@ -186,57 +219,66 @@ func cmdShell(db *dorradb.DB) int {
 		if line == "" {
 			continue
 		}
-		parts := strings.SplitN(line, " ", 3)
-		cmd := strings.ToUpper(parts[0])
+		parts := strings.Fields(line)
+		cmd := strings.ToLower(parts[0])
 		switch cmd {
-		case "QUIT", "EXIT":
+		case "q", "quit", "exit":
 			return ExitOK
-		case "GET":
+		case "h", "help", "?":
+			fmt.Fprintln(os.Stderr, `  set <key> <value>   save
+  get <key>           read
+  del <key>           delete
+  stats               info
+  compact             checkpoint / compact WAL
+  quit`)
+		case "get":
 			if len(parts) < 2 {
-				fmt.Fprintln(os.Stderr, "ERR usage: GET key")
+				fmt.Fprintln(os.Stderr, "usage: get <key>")
 				continue
 			}
 			val, err := db.Get([]byte(parts[1]))
 			if errors.Is(err, dorradb.ErrNotFound) {
-				fmt.Println("NIL")
+				fmt.Println("(missing)")
 				continue
 			}
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "ERR %v\n", err)
+				fmt.Fprintf(os.Stderr, "error: %v\n", err)
 				continue
 			}
-			fmt.Printf("OK %s\n", string(val))
-		case "SET":
+			fmt.Println(string(val))
+		case "set":
 			if len(parts) < 3 {
-				fmt.Fprintln(os.Stderr, "ERR usage: SET key value")
+				fmt.Fprintln(os.Stderr, "usage: set <key> <value>")
 				continue
 			}
-			if err := db.Set([]byte(parts[1]), []byte(parts[2])); err != nil {
-				fmt.Fprintf(os.Stderr, "ERR %v\n", err)
+			key := parts[1]
+			val := strings.Join(parts[2:], " ")
+			if err := db.Set([]byte(key), []byte(val)); err != nil {
+				fmt.Fprintf(os.Stderr, "error: %v\n", err)
 				continue
 			}
-			fmt.Println("OK")
-		case "DELETE", "DEL":
+			fmt.Println("saved")
+		case "del", "delete", "rm":
 			if len(parts) < 2 {
-				fmt.Fprintln(os.Stderr, "ERR usage: DELETE key")
+				fmt.Fprintln(os.Stderr, "usage: del <key>")
 				continue
 			}
 			if err := db.Delete([]byte(parts[1])); err != nil {
-				fmt.Fprintf(os.Stderr, "ERR %v\n", err)
+				fmt.Fprintf(os.Stderr, "error: %v\n", err)
 				continue
 			}
-			fmt.Println("OK")
-		case "STATS":
+			fmt.Println("deleted")
+		case "stats", "status":
 			s := db.Stats()
-			fmt.Printf("OK seq=%d keys=%d main=%d wal=%d dead=%d\n", s.Seq, s.LiveKeys, s.MainBytes, s.WALBytes, s.ApproxDeadBytes)
-		case "CHECKPOINT":
+			fmt.Printf("keys=%d  seq=%d  main=%d bytes  wal=%d bytes\n", s.LiveKeys, s.Seq, s.MainBytes, s.WALBytes)
+		case "compact", "checkpoint":
 			if err := db.Checkpoint(context.Background()); err != nil {
-				fmt.Fprintf(os.Stderr, "ERR %v\n", err)
+				fmt.Fprintf(os.Stderr, "error: %v\n", err)
 				continue
 			}
-			fmt.Println("OK")
+			fmt.Println("compacted")
 		default:
-			fmt.Fprintln(os.Stderr, "ERR unknown command")
+			fmt.Fprintf(os.Stderr, "unknown %q — type help\n", cmd)
 		}
 	}
 	return ExitOK

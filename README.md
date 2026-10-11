@@ -1,4 +1,4 @@
-# DoraDB
+# DorraDB
 
 Embedded key-value library for Go (**Linux and Windows**). SQLite-style files, with OS differences behind an internal **VFS** (stdlib + [`gofrs/flock`](https://github.com/gofrs/flock)):
 
@@ -38,27 +38,34 @@ The main file is append-only between checkpoints, so repeated updates of the sam
 
 ### Limits
 
-- Max key: 1 KiB  
-- Max value: 4 MiB  
+- Max key: 1 KiB
+- Max value: 4 MiB
 
 Override via `Options`.
 
 ## CLI
 
-```bash
-go build -o dorradb ./cmd/dorradb
+Easiest — interactive shell on `./app.dorradb`:
 
-./dorradb --db app.dorradb set foo bar
-./dorradb --db app.dorradb get foo
-./dorradb --db app.dorradb delete foo
-./dorradb --db app.dorradb status
-./dorradb --db app.dorradb checkpoint
-./dorradb --db app.dorradb shell
+```bash
+go run ./cmd/dorradb
 ```
 
-Exit codes: `0` ok, `1` error, `2` key not found (`get`).
+Then:
 
-`DORRADB_PATH` can replace `--db`.
+```text
+dorradb> set name Ada
+saved
+dorradb> get name
+Ada
+dorradb> del name
+deleted
+dorradb> quit
+```
+
+Optional: `go run ./cmd/dorradb --db my.db` or one-shot `go run ./cmd/dorradb get name`.
+
+Exit codes: `0` ok, `1` error, `2` key not found (`get`).
 
 ## Format
 
