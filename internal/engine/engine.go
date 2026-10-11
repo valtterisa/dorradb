@@ -24,15 +24,6 @@ import (
 	"dorradb/internal/wal"
 )
 
-// Hardcoded MVP knobs (no public Options yet).
-const (
-	walCheckpointBytes    int64 = 8 << 20
-	walCheckpointInterval       = 30 * time.Second
-	syncWAL                     = true
-	groupCommitMaxOps           = 64
-	groupCommitMaxWait          = 2 * time.Millisecond
-)
-
 type Stats struct {
 	Path            string
 	Seq             uint64
@@ -78,6 +69,7 @@ type Engine struct {
 	main *storage.Main
 	log  *wal.Log
 	idx  *index.Index
+	opts Options
 
 	seq                uint64 // next mutation gets seq+1
 	walBytesSinceCkpt  int64
@@ -96,10 +88,12 @@ var (
 )
 
 // Open locks the DB, opens main+WAL via VFS, recovers, then starts the writer loop.
-func Open(path string) (*Engine, error) {
+// opts should already be normalized (see DefaultOptions / Normalize).
+func Open(path string, opts Options) (*Engine, error) {
 	if path == "" {
 		return nil, errors.New("engine: empty path")
 	}
+	opts = opts.Normalize()
 	fs := vfs.OS()
 	dir := filepath.Dir(path)
 	if dir != "." && dir != "" {
@@ -133,6 +127,7 @@ func Open(path string) (*Engine, error) {
 		main:           main,
 		log:            log,
 		idx:            index.New(),
+		opts:           opts,
 		lastCheckpoint: time.Now(),
 		reqCh:          make(chan request, 256),
 		done:           make(chan struct{}),
@@ -265,9 +260,9 @@ func (e *Engine) handleStats(req request) {
 // handleMutations gathers a group of Sets/Deletes, then applyGroup (one WAL sync).
 func (e *Engine) handleMutations(first request) {
 	group := []request{first}
-	deadline := time.Now().Add(groupCommitMaxWait)
+	deadline := time.Now().Add(e.opts.GroupCommitMaxWait)
 gather:
-	for len(group) < groupCommitMaxOps {
+	for len(group) < e.opts.GroupCommitMaxOps {
 		wait := time.Until(deadline)
 		if wait <= 0 {
 			break
@@ -332,7 +327,7 @@ func (e *Engine) applyGroup(group []request) {
 		}
 		items = append(items, prepared{req: req, rec: rec, frameLen: int64(n)})
 	}
-	if syncWAL {
+	if e.opts.SyncWAL {
 		if err := e.log.Sync(); err != nil {
 			for _, r := range group {
 				r.reply <- reply{err: err}
@@ -358,8 +353,8 @@ func (e *Engine) maybeCheckpoint() {
 	if e.ckptInFlight || !e.mutationsSinceCkpt {
 		return
 	}
-	bySize := e.walBytesSinceCkpt >= walCheckpointBytes
-	byTime := time.Since(e.lastCheckpoint) >= walCheckpointInterval
+	bySize := e.walBytesSinceCkpt >= e.opts.WALCheckpointBytes
+	byTime := time.Since(e.lastCheckpoint) >= e.opts.WALCheckpointInterval
 	if bySize || byTime {
 		_ = e.compact()
 	}

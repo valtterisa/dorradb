@@ -26,13 +26,35 @@ _ = db.Delete([]byte("k"))
 
 `Open` creates the database if it does not exist. Only one process may open a given path at a time (`ErrLocked` if another process holds the advisory lock). The OS releases the lock when the process exits or crashes.
 
+### Options
+
+Pass an optional `Options` to tune durability and checkpoints. Zero fields keep defaults (`DefaultOptions`):
+
+```go
+db, err := dorradb.Open("app.dorradb", dorradb.Options{
+    WALCheckpointBytes:    32 << 20,       // checkpoint after 32 MiB of WAL growth
+    WALCheckpointInterval: 60 * time.Second,
+    DisableSync:           true,           // skip WAL fsync (faster, less durable)
+    GroupCommitMaxOps:     128,
+    GroupCommitMaxWait:    5 * time.Millisecond,
+})
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `WALCheckpointBytes` | 8 MiB | Checkpoint when WAL growth reaches this size |
+| `WALCheckpointInterval` | 30s | Checkpoint after this long with mutations |
+| `DisableSync` | `false` | If `true`, skip WAL fsync on group commit |
+| `GroupCommitMaxOps` | 64 | Max mutations per WAL sync |
+| `GroupCommitMaxWait` | 2ms | Max wait to coalesce writers before sync |
+
 ### Durability
 
-1. Mutations are **group-committed** to the WAL and fsynced (by default).
+1. Mutations are **group-committed** to the WAL and fsynced (unless `DisableSync`).
 2. Then applied to the main file and acknowledged.
 3. On crash, recovery scans the main file (ignoring a torn tail) and replays WAL records with seq greater than the main file’s max seq.
 
-Checkpoints compact live keys into a new main file (`*.tmp` → fsync → rename → **fsync parent directory**) and truncate the WAL. Triggers: WAL growth ≥ 8 MiB or ≥ 30s since last checkpoint (with mutations).
+Checkpoints compact live keys into a new main file (`*.tmp` → fsync → rename → **fsync parent directory**) and truncate the WAL. By default they run when WAL growth reaches 8 MiB or 30s have passed with mutations (see Options).
 
 The main file is append-only between checkpoints, so repeated updates of the same key leave garbage until compact (`Stats.ApproxDeadBytes`).
 

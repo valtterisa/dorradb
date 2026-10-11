@@ -22,11 +22,21 @@ type DB struct {
 
 // Open creates or opens a database at path (SQLite-style file).
 // Also creates path-wal and path.lock as needed.
-func Open(path string) (*DB, error) {
+//
+// Optional opts overrides defaults (see Options and DefaultOptions). Only the
+// first Options value is used.
+//
+//	dorradb.Open("app.dorradb")
+//	dorradb.Open("app.dorradb", dorradb.Options{DisableSync: true})
+func Open(path string, opts ...Options) (*DB, error) {
 	if path == "" {
 		return nil, errors.New("dorradb: empty path")
 	}
-	eng, err := engine.Open(path)
+	var o Options
+	if len(opts) > 0 {
+		o = opts[0]
+	}
+	eng, err := engine.Open(path, o.toEngine())
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -42,7 +52,8 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 	return val, mapErr(err)
 }
 
-// Set creates or overwrites key. Durable after return (WAL is fsynced).
+// Set creates or overwrites key. Durable after return when WAL sync is enabled
+// (the default; see Options.DisableSync).
 func (db *DB) Set(key, value []byte) error {
 	if err := checkKey(key); err != nil {
 		return err

@@ -4,6 +4,13 @@
 //
 //	db, err := dorradb.Open("app.dorradb")
 //
+// Tune durability or checkpointing with Options (zeros keep defaults):
+//
+//	db, err := dorradb.Open("app.dorradb", dorradb.Options{
+//	    WALCheckpointBytes: 32 << 20,
+//	    DisableSync:        true,
+//	})
+//
 // Files used: path, path+"-wal", path+".lock". Values live on disk; an in-memory
 // index maps keys to offsets. Mutations are group-committed to the WAL before
 // being applied to the main file.
