@@ -1,0 +1,6 @@
+.tmp/
+*.exe
+*.dorradb
+*.dorradb-wal
+*.dorradb.lock
+*.dorradb.tmp
