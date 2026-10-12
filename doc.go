@@ -13,6 +13,6 @@
 //	_ = tx.Set([]byte("b"), []byte("2"))
 //	err = tx.Commit()
 //
-// Files: path, path+"-wal", path+".lock". Multi-process readers are not supported
-// yet (exclusive lock on open). Do not hold transactions open longer than needed.
+// Files: path, path+"-wal", path+".lock". One process opens a path (exclusive
+// lock). Do not hold transactions open longer than needed.
 package dorradb

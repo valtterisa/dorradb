@@ -22,7 +22,6 @@ app.dorradb.lock    # exclusive advisory lock
 - [x] Version numbers (`sequence`) on every record
 - [x] **MVCC + multi-reader** (SQLite WAL-style) — many readers + one writer; readers use statement snapshots and don’t wait on the writer goroutine (same process)
 - [x] **ACID Transaction API** — every op is a tx (AUTOCOMMIT `Get`/`Set`, or `Begin` / `Commit` / `Rollback`); snapshot isolation; single writer; writes buffered until commit
-- [ ] **Multi-process readers** — shared lock for readers, exclusive for writer (full SQLite-WAL process model)
 
 ### Reliability
 
