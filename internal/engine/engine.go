@@ -71,10 +71,10 @@ type Engine struct {
 
 	sequence           uint64 // next mutation gets sequence+1 (writer-only)
 	committedSequence  atomic.Uint64
-	walBytesSinceCkpt  int64
-	lastCheckpoint     time.Time
-	mutationsSinceCkpt bool
-	ckptInFlight       bool
+	walBytesSinceCheckpoint  int64
+	lastCheckpoint           time.Time
+	mutationsSinceCheckpoint bool
+	checkpointInFlight       bool
 
 	pinMu    sync.Mutex
 	pinCond  *sync.Cond
@@ -182,9 +182,9 @@ func (e *Engine) recover() error {
 		return err
 	}
 	e.committedSequence.Store(e.sequence)
-	e.walBytesSinceCkpt = e.log.Size() - encode.HeaderSize
-	if e.walBytesSinceCkpt < 0 {
-		e.walBytesSinceCkpt = 0
+	e.walBytesSinceCheckpoint = e.log.Size() - encode.HeaderSize
+	if e.walBytesSinceCheckpoint < 0 {
+		e.walBytesSinceCheckpoint = 0
 	}
 	return nil
 }
@@ -321,8 +321,14 @@ gather:
 	e.maybeCheckpoint()
 }
 
-// applyGroup: WAL append all → Sync once → main + index → publish committedSequence → ack.
-// If Sync fails, nothing is applied to main (WAL may still have bytes on disk).
+// applyGroup: WAL append all → Sync once → main + index for the whole group →
+// publish committedSequence → ack all OK.
+//
+// If Sync fails, nothing is applied to main (WAL may still have unsynced bytes).
+// After Sync succeeds the group is durable on WAL: a mid-group main.Append
+// failure aborts further apply, does not publish committedSequence, and returns
+// the same error to every waiter. Callers must not treat that as “mutation
+// rejected”; reopen/recover will install the synced records from WAL.
 func (e *Engine) applyGroup(group []request) {
 	if len(group) == 0 {
 		return
@@ -360,38 +366,32 @@ func (e *Engine) applyGroup(group []request) {
 		}
 	}
 
-	type result struct {
-		req request
-		err error
-	}
-	results := make([]result, 0, len(items))
 	var appliedHigh uint64
 	for _, it := range items {
 		loc, err := e.main.Append(it.rec)
 		if err != nil {
-			results = append(results, result{req: it.req, err: err})
-			continue
+			for _, it2 := range items {
+				it2.req.reply <- reply{err: err}
+			}
+			return
 		}
 		e.idx.Apply(it.rec.Key, loc)
 		appliedHigh = it.rec.Sequence
-		e.walBytesSinceCkpt += it.frameLen
-		e.mutationsSinceCkpt = true
-		results = append(results, result{req: it.req})
+		e.walBytesSinceCheckpoint += it.frameLen
+		e.mutationsSinceCheckpoint = true
 	}
-	if appliedHigh > 0 {
-		e.committedSequence.Store(appliedHigh)
-	}
-	for _, r := range results {
-		r.req.reply <- reply{err: r.err}
+	e.committedSequence.Store(appliedHigh)
+	for _, it := range items {
+		it.req.reply <- reply{}
 	}
 }
 
 // maybeCheckpoint triggers compact when WAL grew enough or enough time passed.
 func (e *Engine) maybeCheckpoint() {
-	if e.ckptInFlight || !e.mutationsSinceCkpt {
+	if e.checkpointInFlight || !e.mutationsSinceCheckpoint {
 		return
 	}
-	bySize := e.walBytesSinceCkpt >= e.opts.WALCheckpointBytes
+	bySize := e.walBytesSinceCheckpoint >= e.opts.WALCheckpointBytes
 	byTime := time.Since(e.lastCheckpoint) >= e.opts.WALCheckpointInterval
 	if bySize || byTime {
 		_ = e.compact()
@@ -405,8 +405,8 @@ func (e *Engine) compact() error {
 		return nil
 	}
 
-	e.ckptInFlight = true
-	defer func() { e.ckptInFlight = false }()
+	e.checkpointInFlight = true
+	defer func() { e.checkpointInFlight = false }()
 
 	// Re-check under pinMu so a pin cannot slip in after the count check and
 	// before we replace the main file. Writers own the loop; readers only pin.
@@ -468,8 +468,8 @@ func (e *Engine) compact() error {
 		e.pinMu.Unlock()
 		return err
 	}
-	e.walBytesSinceCkpt = 0
-	e.mutationsSinceCkpt = false
+	e.walBytesSinceCheckpoint = 0
+	e.mutationsSinceCheckpoint = false
 	e.lastCheckpoint = time.Now()
 	e.pinMu.Unlock()
 	return nil
