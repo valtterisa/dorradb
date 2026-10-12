@@ -11,4 +11,6 @@ var (
 	ErrTooLarge           = errors.New("dorradb: key or value too large")
 	ErrCorrupt            = errors.New("dorradb: corrupt data")
 	ErrUnsupportedVersion = errors.New("dorradb: unsupported format version")
+	ErrTxClosed           = errors.New("dorradb: transaction closed")
+	ErrTxNotWritable      = errors.New("dorradb: transaction is read-only")
 )

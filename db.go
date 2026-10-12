@@ -2,6 +2,7 @@ package dorradb
 
 import (
 	"errors"
+	"sync"
 
 	"dorradb/internal/encode"
 	"dorradb/internal/engine"
@@ -14,10 +15,12 @@ const (
 )
 
 // DB is the public handle. All methods are safe to call from multiple goroutines.
-// Mutations run on a single writer loop; Get/Has use MVCC statement snapshots and
-// do not wait on that loop.
+// Every read and write runs inside a transaction (AUTOCOMMIT for Get/Set/Delete/Has,
+// or explicit Begin/Commit/Rollback). One writable tx at a time; reads use MVCC
+// snapshot isolation.
 type DB struct {
-	eng *engine.Engine
+	eng     *engine.Engine
+	writeMu sync.Mutex // at most one writable Tx
 }
 
 // Open creates or opens a database at path (SQLite-style file).
@@ -43,42 +46,51 @@ func Open(path string, opts ...Options) (*DB, error) {
 	return &DB{eng: eng}, nil
 }
 
-// Get returns a copy of the value for key, or ErrNotFound.
+// Get returns a copy of the value for key, or ErrNotFound (AUTOCOMMIT read tx).
 func (db *DB) Get(key []byte) ([]byte, error) {
-	if err := checkKey(key); err != nil {
+	tx, err := db.Begin(false)
+	if err != nil {
 		return nil, err
 	}
-	val, err := db.eng.Get(key)
-	return val, mapErr(err)
+	defer tx.Rollback()
+	return tx.Get(key)
 }
 
-// Set creates or overwrites key. Durable after return when WAL sync is enabled
-// (the default; see Options.DisableSync).
+// Set creates or overwrites key (AUTOCOMMIT write tx). Durable after return when
+// WAL sync is enabled (default; see Options.DisableSync).
 func (db *DB) Set(key, value []byte) error {
-	if err := checkKey(key); err != nil {
+	tx, err := db.Begin(true)
+	if err != nil {
 		return err
 	}
-	if len(value) > maxValueBytes {
-		return ErrTooLarge
+	defer tx.Rollback()
+	if err := tx.Set(key, value); err != nil {
+		return err
 	}
-	return mapErr(db.eng.Set(key, value))
+	return tx.Commit()
 }
 
-// Delete removes key. Missing keys are not an error.
+// Delete removes key (AUTOCOMMIT write tx). Missing keys are not an error.
 func (db *DB) Delete(key []byte) error {
-	if err := checkKey(key); err != nil {
+	tx, err := db.Begin(true)
+	if err != nil {
 		return err
 	}
-	return mapErr(db.eng.Delete(key))
+	defer tx.Rollback()
+	if err := tx.Delete(key); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
-// Has reports whether key exists (no value copy).
+// Has reports whether key exists (AUTOCOMMIT read tx).
 func (db *DB) Has(key []byte) (bool, error) {
-	if err := checkKey(key); err != nil {
+	tx, err := db.Begin(false)
+	if err != nil {
 		return false, err
 	}
-	ok, err := db.eng.Has(key)
-	return ok, mapErr(err)
+	defer tx.Rollback()
+	return tx.Has(key)
 }
 
 // Stats returns sizes and counters (see Stats fields).
@@ -97,6 +109,7 @@ func (db *DB) Stats() Stats {
 }
 
 // Close flushes, releases the file lock, and closes files. Safe to call once.
+// Waits for any open transaction pins to be released.
 func (db *DB) Close() error {
 	return mapErr(db.eng.Close())
 }

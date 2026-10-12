@@ -1,6 +1,6 @@
 # DorraDB
 
-Embedded key-value store for Go on **Linux and Windows**. One process opens a path; values live on disk; an in-memory index maps keys to offsets. Mutations are group-committed through a WAL, then applied to the main file.
+Embedded key-value store for Go on **Linux and Windows**. DorraDB provides **ACID transactions**. One process opens a path; values live on disk; an in-memory index maps keys to offsets. Mutations are group-committed through a WAL, then applied to the main file.
 
 **Outside pull requests are not accepted.** Open an [issue](https://github.com/valtterisa/dorradb/issues) if something is wrong, unclear, or broken — reports and discussion are welcome. Changes land from the maintainer only.
 
@@ -21,7 +21,7 @@ app.dorradb.lock    # exclusive advisory lock
 - [x] One writer at a time, WAL + checkpoint, exclusive file lock
 - [x] Version numbers (`sequence`) on every record
 - [x] **MVCC + multi-reader** (SQLite WAL-style) — many readers + one writer; readers use statement snapshots and don’t wait on the writer goroutine (same process)
-- [ ] **Transaction API** — `Begin` / `Commit` / `Rollback` (reuses MVCC pins + visibility; writes buffered until commit)
+- [x] **ACID Transaction API** — every op is a tx (AUTOCOMMIT `Get`/`Set`, or `Begin` / `Commit` / `Rollback`); snapshot isolation; single writer; writes buffered until commit
 - [ ] **Multi-process readers** — shared lock for readers, exclusive for writer (full SQLite-WAL process model)
 
 ### Reliability
@@ -49,22 +49,41 @@ val, err := db.Get([]byte("user:1"))
 ok, err := db.Has([]byte("user:1"))
 err = db.Delete([]byte("user:1"))
 stats := db.Stats()
+
+tx, err := db.Begin(true)
+defer tx.Rollback()
+err = tx.Set([]byte("a"), []byte("1"))
+err = tx.Set([]byte("b"), []byte("2"))
+err = tx.Commit()
 ```
 
 `Open` creates the database if missing. Only one process may hold the path (`ErrLocked` otherwise). The OS releases the lock on exit or crash.
 
-All methods are safe for concurrent use. Mutations run on a single writer loop.
-`Get` / `Has` take a statement snapshot at the committed sequence (MVCC) and do not
-queue behind the writer.
+All `DB` methods are safe for concurrent use. Every read and write runs inside a
+transaction (AUTOCOMMIT for single `Get`/`Set`/`Delete`/`Has`, or explicit
+`Begin` / `Commit` / `Rollback`). Do not use one `Tx` from multiple goroutines.
 
 | Method | Notes |
 | --- | --- |
-| `Get` | Returns a copy of the value, or `ErrNotFound` (statement snapshot) |
-| `Set` | Create or overwrite; durable and visible after return when WAL sync is on (default) |
-| `Delete` | Missing keys are not an error |
-| `Has` | Existence check without copying the value (statement snapshot) |
+| `Get` | AUTOCOMMIT read tx; copy of value, or `ErrNotFound` |
+| `Set` | AUTOCOMMIT write tx; durable and visible after return when WAL sync is on (default) |
+| `Delete` | AUTOCOMMIT write tx; missing keys are not an error |
+| `Has` | AUTOCOMMIT read tx; existence without copying the value |
+| `Begin` | Start a tx (`writable`); then `Get`/`Set`/`Delete`/`Has` on `Tx` |
+| `Tx.Commit` / `Tx.Rollback` | Apply or discard buffered writes |
 | `Stats` | Path, sequence, committed sequence, pinned readers, live keys, file sizes, approx dead bytes |
-| `Close` | Flush, unlock, close files |
+| `Close` | Flush, unlock, close files (waits for open tx pins) |
+
+### Transactions (ACID)
+
+DorraDB provides **ACID transactions**:
+
+- **Atomic** — all ops in a tx commit together or not at all; rollback discards
+- **Consistent** — no torn published state; the app owns higher-level invariants (KV has no schema)
+- **Isolated** — snapshot reads at `Begin`; one writable tx at a time (like SQLite WAL)
+- **Durable** — WAL fsync on commit unless `DisableSync`
+
+Writes are buffered until `Commit`. Open pins defer checkpoints — don’t hold transactions open longer than needed.
 
 ### Options
 
@@ -109,6 +128,8 @@ Check with `errors.Is`:
 | `ErrTooLarge` | Key > 1 KiB or value > 4 MiB |
 | `ErrLocked` | Another process holds the advisory lock |
 | `ErrClosed` | Use after `Close` |
+| `ErrTxClosed` | Use of a tx after `Commit` / `Rollback` |
+| `ErrTxNotWritable` | `Set` / `Delete` on a read-only tx |
 | `ErrCorrupt` | Bad magic, mid-file CRC failure, etc. |
 | `ErrUnsupportedVersion` | On-disk `formatVersion` newer than this build |
 

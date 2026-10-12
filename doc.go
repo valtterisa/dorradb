@@ -1,26 +1,18 @@
 // Package dorradb is an embedded key-value store with a WAL and checkpoints.
 //
-// Open a database file (created if missing):
+// DorraDB provides ACID transactions. Every read and write runs inside a
+// transaction (AUTOCOMMIT for single Get/Set/Delete/Has, or explicit
+// Begin / Commit / Rollback). Commits are atomic and durable (WAL sync on by
+// default); readers use snapshot isolation; one writer at a time.
 //
 //	db, err := dorradb.Open("app.dorradb")
 //
-// Tune durability or checkpointing with Options (zeros keep defaults):
+//	tx, err := db.Begin(true)
+//	defer tx.Rollback()
+//	_ = tx.Set([]byte("a"), []byte("1"))
+//	_ = tx.Set([]byte("b"), []byte("2"))
+//	err = tx.Commit()
 //
-//	db, err := dorradb.Open("app.dorradb", dorradb.Options{
-//	    WALCheckpointBytes: 32 << 20,
-//	    DisableSync:        true,
-//	})
-//
-// Files used: path, path+"-wal", path+".lock". Values live on disk; an in-memory
-// index maps keys to versioned offsets. Mutations are group-committed to the WAL
-// before being applied to the main file and published via a committed sequence.
-//
-// Same-process MVCC: Get/Has take a statement snapshot at the committed sequence
-// and do not wait on the writer goroutine. Multi-process readers are not supported
-// yet (exclusive lock on open). A Transaction API can reuse the same pins and
-// visibility rules later.
-//
-// OS I/O goes through an internal VFS (Linux and Windows). File locking uses
-// github.com/gofrs/flock. Monotonic sequence numbers on records are the MVCC
-// logical timestamps.
+// Files: path, path+"-wal", path+".lock". Multi-process readers are not supported
+// yet (exclusive lock on open). Do not hold transactions open longer than needed.
 package dorradb

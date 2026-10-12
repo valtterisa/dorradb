@@ -43,14 +43,23 @@ type opKind int
 const (
 	opSet opKind = iota
 	opDelete
+	opBatch
 	opStats
 	opClose
 )
+
+// Mutation is one Set or Delete in an ApplyBatch.
+type Mutation struct {
+	Delete bool
+	Key    []byte
+	Value  []byte // ignored when Delete is true
+}
 
 type request struct {
 	kind  opKind
 	key   []byte
 	value []byte
+	batch []Mutation
 	reply chan reply
 }
 
@@ -202,7 +211,7 @@ func (e *Engine) cleanup() {
 }
 
 // Pin holds a snapshot so compact will not reclaim Locs the reader still needs.
-// Returns false if the engine is closed. Exported for a future Transaction API.
+// Returns false if the engine is closed.
 func (e *Engine) Pin(sequence uint64) bool {
 	e.pinMu.Lock()
 	defer e.pinMu.Unlock()
@@ -214,12 +223,15 @@ func (e *Engine) Pin(sequence uint64) bool {
 	return true
 }
 
-// Unpin releases a Pin. Exported for a future Transaction API.
+// Unpin releases a Pin. Extra Unpin calls are a no-op (no underflow).
 func (e *Engine) Unpin(sequence uint64) {
 	e.pinMu.Lock()
 	defer e.pinMu.Unlock()
 	n := e.pins[sequence]
-	if n <= 1 {
+	if n <= 0 {
+		return
+	}
+	if n == 1 {
 		delete(e.pins, sequence)
 	} else {
 		e.pins[sequence] = n - 1
@@ -263,6 +275,8 @@ func (e *Engine) loop() {
 			return
 		case opStats:
 			e.handleStats(req)
+		case opBatch:
+			e.handleBatch(req)
 		case opSet, opDelete:
 			e.handleMutations(req)
 		}
@@ -306,6 +320,10 @@ gather:
 			switch req.kind {
 			case opSet, opDelete:
 				group = append(group, req)
+			case opBatch:
+				e.applyGroup(group)
+				e.handleBatch(req)
+				return
 			case opClose:
 				e.applyGroup(group)
 				e.finishClose(req)
@@ -321,48 +339,68 @@ gather:
 	e.maybeCheckpoint()
 }
 
-// applyGroup: WAL append all → Sync once → main + index for the whole group →
-// publish committedSequence → ack all OK.
-//
-// If Sync fails, nothing is applied to main (WAL may still have unsynced bytes).
-// After Sync succeeds the group is durable on WAL: a mid-group main.Append
-// failure aborts further apply, does not publish committedSequence, and returns
-// the same error to every waiter. Callers must not treat that as “mutation
-// rejected”; reopen/recover will install the synced records from WAL.
+// handleBatch applies one transactional batch without coalescing other writers.
+func (e *Engine) handleBatch(req request) {
+	err := e.applyMutations(req.batch)
+	req.reply <- reply{err: err}
+	if err == nil {
+		e.maybeCheckpoint()
+	}
+}
+
+// applyGroup converts single-op requests into mutations, applies them, and acks.
 func (e *Engine) applyGroup(group []request) {
 	if len(group) == 0 {
 		return
 	}
+	ops := make([]Mutation, len(group))
+	for i, req := range group {
+		ops[i] = Mutation{
+			Delete: req.kind == opDelete,
+			Key:    req.key,
+			Value:  req.value,
+		}
+	}
+	err := e.applyMutations(ops)
+	for _, r := range group {
+		r.reply <- reply{err: err}
+	}
+}
+
+// applyMutations: WAL append all → Sync once → main + index → publish committedSequence.
+//
+// If Sync fails, nothing is applied to main (WAL may still have unsynced bytes).
+// After Sync succeeds the group is durable on WAL: a mid-group main.Append
+// failure aborts further apply, does not publish committedSequence, and returns
+// the error. Callers must not treat that as “mutation rejected”; reopen/recover
+// will install the synced records from WAL.
+func (e *Engine) applyMutations(ops []Mutation) error {
+	if len(ops) == 0 {
+		return nil
+	}
 	type prepared struct {
-		req      request
 		rec      encode.Record
 		frameLen int64
 	}
-	items := make([]prepared, 0, len(group))
-	for _, req := range group {
+	items := make([]prepared, 0, len(ops))
+	for _, op := range ops {
 		e.sequence++
-		rec := encode.Record{Sequence: e.sequence, Key: req.key}
-		if req.kind == opSet {
-			rec.Op = encode.OpSet
-			rec.Value = req.value
-		} else {
+		rec := encode.Record{Sequence: e.sequence, Key: op.Key}
+		if op.Delete {
 			rec.Op = encode.OpDelete
+		} else {
+			rec.Op = encode.OpSet
+			rec.Value = op.Value
 		}
 		_, n, err := e.log.Append(rec)
 		if err != nil {
-			for _, r := range group {
-				r.reply <- reply{err: err}
-			}
-			return
+			return err
 		}
-		items = append(items, prepared{req: req, rec: rec, frameLen: int64(n)})
+		items = append(items, prepared{rec: rec, frameLen: int64(n)})
 	}
 	if e.opts.SyncWAL {
 		if err := e.log.Sync(); err != nil {
-			for _, r := range group {
-				r.reply <- reply{err: err}
-			}
-			return
+			return err
 		}
 	}
 
@@ -370,10 +408,7 @@ func (e *Engine) applyGroup(group []request) {
 	for _, it := range items {
 		loc, err := e.main.Append(it.rec)
 		if err != nil {
-			for _, it2 := range items {
-				it2.req.reply <- reply{err: err}
-			}
-			return
+			return err
 		}
 		e.idx.Apply(it.rec.Key, loc)
 		appliedHigh = it.rec.Sequence
@@ -381,9 +416,24 @@ func (e *Engine) applyGroup(group []request) {
 		e.mutationsSinceCheckpoint = true
 	}
 	e.committedSequence.Store(appliedHigh)
-	for _, it := range items {
-		it.req.reply <- reply{}
+	return nil
+}
+
+// ApplyBatch durably applies ops as one atomic publish (no mid-batch coalescing
+// with unrelated Sets/Deletes). Empty ops is a no-op.
+func (e *Engine) ApplyBatch(ops []Mutation) error {
+	if len(ops) == 0 {
+		return nil
 	}
+	batch := make([]Mutation, len(ops))
+	for i, op := range ops {
+		batch[i] = Mutation{
+			Delete: op.Delete,
+			Key:    append([]byte(nil), op.Key...),
+			Value:  append([]byte(nil), op.Value...),
+		}
+	}
+	return e.call(request{kind: opBatch, batch: batch}).err
 }
 
 // maybeCheckpoint triggers compact when WAL grew enough or enough time passed.
@@ -515,7 +565,7 @@ func (e *Engine) Get(key []byte) ([]byte, error) {
 }
 
 // GetAt returns the value visible at snapshotSequence. Pins for the call duration
-// (a future Tx can hold an additional long-lived Pin on the same sequence).
+// (a Tx may hold an additional long-lived Pin on the same sequence).
 func (e *Engine) GetAt(key []byte, snapshotSequence uint64) ([]byte, error) {
 	if e.closed.Load() {
 		return nil, ErrClosed
