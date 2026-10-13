@@ -1,0 +1,6 @@
+1. page id on pages when flushing? do we use pages?
+2. what do we load in memory? index? how do we manage the memory and is there
+more efficient data structure or way?
+3. we are sequential on nonvolatile storage but do we serialize correctly?
+4. is WAL recovery working correctly?
+5. do we have or need a storage manager? i dont know because we are one file
