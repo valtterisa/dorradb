@@ -1,6 +1,6 @@
 # DorraDB
 
-Embedded key-value store for Go on **Linux and Windows**. DorraDB provides **ACID transactions**. One process opens a path; values live on disk; an in-memory index maps keys to offsets. Mutations are group-committed through a WAL, then applied to the main file.
+Embedded key-value store for Go on **Linux and Windows**. DorraDB provides **ACID transactions**. One process opens a path; values live in **4 KiB pages** on disk; an in-memory index maps keys to `(page, slot)`. Mutations are group-committed through a WAL, then applied to in-memory pages (flushed on checkpoint).
 
 **Outside pull requests are not accepted.** Open an [issue](https://github.com/valtterisa/dorradb/issues) if something is wrong, unclear, or broken — reports and discussion are welcome. Changes land from the maintainer only.
 
@@ -9,7 +9,7 @@ Licensed under [MIT](LICENSE).
 OS I/O goes through an internal VFS (stdlib + [`gofrs/flock`](https://github.com/gofrs/flock)). Engine code only sees `vfs.FS`.
 
 ```text
-app.dorradb         # main database (append-only between checkpoints)
+app.dorradb         # main database (4 KiB pages; heap records + overflow)
 app.dorradb-wal     # write-ahead log
 app.dorradb.lock    # exclusive advisory lock
 ```
@@ -29,7 +29,7 @@ app.dorradb.lock    # exclusive advisory lock
 
 ### Later (SQL)
 
-- [ ] **B-tree** (or equivalent) storage for ordered keys / range scans
+- [ ] **B-tree** (or equivalent) on the existing pager for ordered keys / range scans
 - [ ] **Query planner**
 - [ ] **Query engine** — execute plans against the store
 - [ ] **SQL** — parser + bind to the planner/engine
@@ -109,12 +109,12 @@ db, err := dorradb.Open("app.dorradb", dorradb.Options{
 ### Durability
 
 1. Mutations are **group-committed** to the WAL and fsynced (unless `DisableSync`).
-2. Then appended to the main file and the RAM version index; then `committedSequence` is published and the call returns.
-3. On open after a crash: scan the main file (ignore a torn last record), then replay WAL records with sequence greater than the main file’s max sequence.
+2. Then applied to **in-memory pages** (marked dirty) and the RAM version index; then `committedSequence` is published and the call returns.
+3. On open after a crash: scan heap pages into the RAM index, then replay WAL records with sequence greater than the main file’s max sequence.
 
-Checkpoints rewrite live keys into a new main file (`*.tmp` → fsync → rename → **fsync parent directory**) and truncate the WAL. They defer while any reader pin is held. By default they run at 8 MiB of WAL growth or after 30s with mutations.
+Checkpoints **flush dirty pages**, update the meta header, and truncate the WAL. Page addresses stay stable, so reader pins do not block flush. By default checkpoints run at 8 MiB of WAL growth or after 30s with mutations.
 
-The main file is append-only between checkpoints, so updates and deletes leave garbage until compact (`Stats.ApproxDeadBytes`).
+Updates and deletes leave old slots until a future vacuum (`Stats.ApproxDeadBytes` approximates unused space).
 
 ### Errors
 
@@ -174,9 +174,11 @@ Exit codes: `0` ok, `1` error, `2` key not found (`get`).
 
 ## On-disk format
 
-Little-endian frames with IEEE CRC32. Fixed 64-byte header: magic `DORA` (`0x41524F44`), file type (main=1, WAL=2), `formatVersion = 1`, sequence, WAL checkpoint offset, header CRC.
+**`formatVersion = 2`** (v1 append-log files are not readable).
 
-Records: length-prefixed payload + CRC. Ops: set (1), delete (2). Newer format versions refuse to open (`ErrUnsupportedVersion`). A torn last record is treated as a crash tail; a CRC failure mid-file is `ErrCorrupt`.
+**Main file:** fixed **4096-byte pages**. Page 0 is meta (64-byte header + marker): magic `DORA` (`0x41524F44`), file type (main=1), sequence, WAL checkpoint offset, page size, page count, freelist head, header CRC. Data pages use a typed header (`Heap`, `Overflow`; `BTree*` reserved). Heap pages are slotted; large values use overflow page chains.
+
+**WAL:** little-endian frames with IEEE CRC32 — length-prefixed payload + CRC. Ops: set (1), delete (2). Torn last record → crash tail; mid-file CRC → `ErrCorrupt`. Newer format versions refuse to open (`ErrUnsupportedVersion`).
 
 ## Contributing
 

@@ -3,13 +3,13 @@
 // Write path (Set/Delete):
 //  1. queue request to the writer goroutine
 //  2. group-commit: append several WAL records, one Sync
-//  3. append same records to main file + update RAM index
+//  3. apply same records to heap pages + update RAM index
 //  4. publish committedSequence, reply OK
-//  5. maybe checkpoint (WAL size or time) if no reader pins
+//  5. maybe checkpoint (flush dirty pages, truncate WAL)
 //
-// Read path (Get/Has): pin committedSequence, GetVisible, ReadAt — does not wait on writer.
+// Read path (Get/Has): pin committedSequence, GetVisible, read page slot — does not wait on writer.
 //
-// Recovery on Open: scan main → replay WAL records with sequence > main max sequence.
+// Recovery on Open: scan heap pages → replay WAL records with sequence > main max sequence.
 package engine
 
 import (
@@ -68,18 +68,18 @@ type reply struct {
 	err   error
 }
 
-// Engine owns the lock, main file, WAL, index, and the writer loop.
+// Engine owns the lock, main store, WAL, index, and the writer loop.
 type Engine struct {
-	path string
-	fs   vfs.FS
-	lk   vfs.Lock
-	main *storage.Main
-	log  *wal.Log
-	idx  *index.Index
-	opts Options
+	path  string
+	fs    vfs.FS
+	lk    vfs.Lock
+	main  *storage.Store
+	log   *wal.Log
+	idx   *index.Index
+	opts  Options
 
-	sequence           uint64 // next mutation gets sequence+1 (writer-only)
-	committedSequence  atomic.Uint64
+	sequence                 uint64 // next mutation gets sequence+1 (writer-only)
+	committedSequence        atomic.Uint64
 	walBytesSinceCheckpoint  int64
 	lastCheckpoint           time.Time
 	mutationsSinceCheckpoint bool
@@ -90,9 +90,9 @@ type Engine struct {
 	pins     map[uint64]int // snapshotSequence → refcount
 	pinCount int
 
-	reqCh  chan request // mutations / stats / close
+	reqCh  chan request
 	closed atomic.Bool
-	done   chan struct{} // closed when writer loop exits
+	done   chan struct{}
 }
 
 var (
@@ -101,7 +101,6 @@ var (
 )
 
 // Open locks the DB, opens main+WAL via VFS, recovers, then starts the writer loop.
-// opts should already be normalized (see DefaultOptions / Normalize).
 func Open(path string, opts Options) (*Engine, error) {
 	if path == "" {
 		return nil, errors.New("engine: empty path")
@@ -115,13 +114,12 @@ func Open(path string, opts Options) (*Engine, error) {
 		}
 	}
 
-	// Exclusive lock so two processes cannot open the same DB.
 	lk, err := fs.Lock(path + ".lock")
 	if err != nil {
 		return nil, err
 	}
 
-	main, err := storage.Open(fs, path, true)
+	main, err := storage.OpenStore(fs, path, true)
 	if err != nil {
 		_ = lk.Unlock()
 		return nil, err
@@ -157,7 +155,7 @@ func Open(path string, opts Options) (*Engine, error) {
 	return e, nil
 }
 
-// recover: load index from main, then replay WAL for sequences not yet on main.
+// recover: load index from heap pages, then replay WAL for sequences not yet on main.
 func (e *Engine) recover() error {
 	if err := e.main.ScanIndex(e.idx); err != nil {
 		return err
@@ -190,6 +188,18 @@ func (e *Engine) recover() error {
 	if err != nil {
 		return err
 	}
+	// Persist pages applied from WAL so a second crash does not re-apply incorrectly
+	// relative to header.Sequence — bump sequence on meta after recovery apply.
+	if e.sequence > e.main.Header().Sequence {
+		h := e.main.Header()
+		h.Sequence = e.sequence
+		if err := e.main.SetHeader(h); err != nil {
+			return err
+		}
+		if err := e.main.FlushAll(); err != nil {
+			return err
+		}
+	}
 	e.committedSequence.Store(e.sequence)
 	e.walBytesSinceCheckpoint = e.log.Size() - encode.HeaderSize
 	if e.walBytesSinceCheckpoint < 0 {
@@ -210,8 +220,7 @@ func (e *Engine) cleanup() {
 	}
 }
 
-// Pin holds a snapshot so compact will not reclaim Locs the reader still needs.
-// Returns false if the engine is closed.
+// Pin holds a snapshot so Prune will not drop versions the reader still needs.
 func (e *Engine) Pin(sequence uint64) bool {
 	e.pinMu.Lock()
 	defer e.pinMu.Unlock()
@@ -261,7 +270,6 @@ func (e *Engine) waitPins() {
 	e.pinMu.Unlock()
 }
 
-// loop is the only goroutine that mutates index/main/WAL (aside from index RLock reads).
 func (e *Engine) loop() {
 	defer close(e.done)
 	for {
@@ -286,7 +294,7 @@ func (e *Engine) loop() {
 func (e *Engine) handleStats(req request) {
 	live := e.idx.ApproxLiveBytes()
 	mainSize := e.main.Size()
-	dead := mainSize - encode.HeaderSize - live
+	dead := mainSize - int64(encode.HeaderSize) - live
 	if dead < 0 {
 		dead = 0
 	}
@@ -303,7 +311,6 @@ func (e *Engine) handleStats(req request) {
 	}}
 }
 
-// handleMutations gathers a group of Sets/Deletes, then applyGroup (one WAL sync).
 func (e *Engine) handleMutations(first request) {
 	group := []request{first}
 	deadline := time.Now().Add(e.opts.GroupCommitMaxWait)
@@ -339,7 +346,6 @@ gather:
 	e.maybeCheckpoint()
 }
 
-// handleBatch applies one transactional batch without coalescing other writers.
 func (e *Engine) handleBatch(req request) {
 	err := e.applyMutations(req.batch)
 	req.reply <- reply{err: err}
@@ -348,7 +354,6 @@ func (e *Engine) handleBatch(req request) {
 	}
 }
 
-// applyGroup converts single-op requests into mutations, applies them, and acks.
 func (e *Engine) applyGroup(group []request) {
 	if len(group) == 0 {
 		return
@@ -367,13 +372,7 @@ func (e *Engine) applyGroup(group []request) {
 	}
 }
 
-// applyMutations: WAL append all → Sync once → main + index → publish committedSequence.
-//
-// If Sync fails, nothing is applied to main (WAL may still have unsynced bytes).
-// After Sync succeeds the group is durable on WAL: a mid-group main.Append
-// failure aborts further apply, does not publish committedSequence, and returns
-// the error. Callers must not treat that as “mutation rejected”; reopen/recover
-// will install the synced records from WAL.
+// applyMutations: WAL append all → Sync once → heap pages + index → publish committedSequence.
 func (e *Engine) applyMutations(ops []Mutation) error {
 	if len(ops) == 0 {
 		return nil
@@ -419,8 +418,7 @@ func (e *Engine) applyMutations(ops []Mutation) error {
 	return nil
 }
 
-// ApplyBatch durably applies ops as one atomic publish (no mid-batch coalescing
-// with unrelated Sets/Deletes). Empty ops is a no-op.
+// ApplyBatch durably applies ops as one atomic publish.
 func (e *Engine) ApplyBatch(ops []Mutation) error {
 	if len(ops) == 0 {
 		return nil
@@ -436,7 +434,6 @@ func (e *Engine) ApplyBatch(ops []Mutation) error {
 	return e.call(request{kind: opBatch, batch: batch}).err
 }
 
-// maybeCheckpoint triggers compact when WAL grew enough or enough time passed.
 func (e *Engine) maybeCheckpoint() {
 	if e.checkpointInFlight || !e.mutationsSinceCheckpoint {
 		return
@@ -444,84 +441,31 @@ func (e *Engine) maybeCheckpoint() {
 	bySize := e.walBytesSinceCheckpoint >= e.opts.WALCheckpointBytes
 	byTime := time.Since(e.lastCheckpoint) >= e.opts.WALCheckpointInterval
 	if bySize || byTime {
-		_ = e.compact()
+		_ = e.checkpoint()
 	}
 }
 
-// compact rewrites only live keys into *.tmp, renames over main, truncates WAL.
-// Deferred while any reader pin is held (Loc offsets would become invalid).
-func (e *Engine) compact() error {
-	if e.pinnedReaderCount() > 0 {
-		return nil
-	}
-
+// checkpoint flushes dirty pages, advances meta sequence / WAL offset, truncates WAL.
+// Page Locs stay stable, so reader pins do not block flush.
+func (e *Engine) checkpoint() error {
 	e.checkpointInFlight = true
 	defer func() { e.checkpointInFlight = false }()
 
-	// Re-check under pinMu so a pin cannot slip in after the count check and
-	// before we replace the main file. Writers own the loop; readers only pin.
-	e.pinMu.Lock()
-	if e.pinCount > 0 {
-		e.pinMu.Unlock()
-		return nil
-	}
-	e.pinMu.Unlock()
-
-	var records []encode.Record
-	err := e.idx.ForEachLive(func(key string, loc index.Loc) error {
-		val, err := e.main.ReadValue(loc)
-		if err != nil {
-			return err
-		}
-		records = append(records, encode.Record{
-			Sequence: loc.Sequence,
-			Op:       encode.OpSet,
-			Key:      []byte(key),
-			Value:    val,
-		})
-		return nil
-	})
-	if err != nil {
+	h := e.main.Header()
+	h.Sequence = e.sequence
+	h.WalCheckpointOffset = encode.HeaderSize
+	if err := e.main.SetHeader(h); err != nil {
 		return err
 	}
-
-	tmp := e.path + ".tmp"
-	h := encode.Header{
-		FileType:            encode.FileTypeMain,
-		FormatVersion:       encode.FormatVersion,
-		Sequence:            e.sequence,
-		WalCheckpointOffset: encode.HeaderSize,
-	}
-	newSize, err := storage.WriteCompactFile(e.fs, tmp, h, records)
-	if err != nil {
-		_ = e.fs.Remove(tmp)
-		return err
-	}
-
-	// Hold pinMu through replace + rescan so no reader can observe stale Locs.
-	e.pinMu.Lock()
-	if e.pinCount > 0 {
-		e.pinMu.Unlock()
-		_ = e.fs.Remove(tmp)
-		return nil
-	}
-	if err := e.main.ReplaceWithCompact(tmp, h, newSize); err != nil {
-		e.pinMu.Unlock()
-		_ = e.fs.Remove(tmp)
+	if err := e.main.FlushAll(); err != nil {
 		return err
 	}
 	if err := e.log.TruncateReset(); err != nil {
-		e.pinMu.Unlock()
-		return err
-	}
-	if err := e.main.ScanIndex(e.idx); err != nil {
-		e.pinMu.Unlock()
 		return err
 	}
 	e.walBytesSinceCheckpoint = 0
 	e.mutationsSinceCheckpoint = false
 	e.lastCheckpoint = time.Now()
-	e.pinMu.Unlock()
 	return nil
 }
 
@@ -529,6 +473,11 @@ func (e *Engine) finishClose(req request) {
 	e.closed.Store(true)
 	e.waitPins()
 	_ = e.log.Sync()
+	// Flush pages so main reflects committed work.
+	h := e.main.Header()
+	h.Sequence = e.sequence
+	_ = e.main.SetHeader(h)
+	_ = e.main.FlushAll()
 	err1 := e.log.Close()
 	err2 := e.main.Close()
 	var err3 error
@@ -559,13 +508,10 @@ func (e *Engine) call(req request) reply {
 	}
 }
 
-// Get reads a statement snapshot at committedSequence without joining the writer queue.
 func (e *Engine) Get(key []byte) ([]byte, error) {
 	return e.GetAt(key, e.committedSequence.Load())
 }
 
-// GetAt returns the value visible at snapshotSequence. Pins for the call duration
-// (a Tx may hold an additional long-lived Pin on the same sequence).
 func (e *Engine) GetAt(key []byte, snapshotSequence uint64) ([]byte, error) {
 	if e.closed.Load() {
 		return nil, ErrClosed
@@ -586,12 +532,10 @@ func (e *Engine) GetAt(key []byte, snapshotSequence uint64) ([]byte, error) {
 	return append([]byte(nil), val...), nil
 }
 
-// Has is a statement-snapshot existence check (same path as Get).
 func (e *Engine) Has(key []byte) (bool, error) {
 	return e.HasAt(key, e.committedSequence.Load())
 }
 
-// HasAt reports whether key exists at snapshotSequence.
 func (e *Engine) HasAt(key []byte, snapshotSequence uint64) (bool, error) {
 	if e.closed.Load() {
 		return false, ErrClosed

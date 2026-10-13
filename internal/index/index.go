@@ -1,17 +1,17 @@
 // Package index is the in-RAM map from key → version chain of on-disk Locs.
-// Values themselves stay in the main file; we only store offsets here.
+// Values themselves stay in pages; we only store page addresses here.
 package index
 
 import "sync"
 
-// Loc points at one record in the main *.dorradb file.
+// Loc points at one record in a heap page (page id + slot).
 type Loc struct {
-	Offset   int64 // start of the framed record
-	Length   int64 // full frame length
-	ValueOff int64 // where the value bytes start (for ReadAt)
-	ValueLen int
-	Sequence uint64 // logical version of this entry
-	Deleted  bool   // tombstone until the next compact
+	PageID       uint32
+	Slot         uint16
+	OverflowPage uint32 // 0 if value is inline on the heap page
+	Bytes        int    // approx on-disk size for stats
+	Sequence     uint64 // logical version of this entry
+	Deleted      bool   // tombstone until vacuum / prune
 }
 
 // version is one link in a newest-first chain.
@@ -98,13 +98,13 @@ func (idx *Index) ApproxLiveBytes() int64 {
 	var n int64
 	for _, v := range idx.m {
 		if v != nil && !v.loc.Deleted {
-			n += v.loc.Length
+			n += int64(v.loc.Bytes)
 		}
 	}
 	return n
 }
 
-// ForEachLive visits newest non-deleted keys (used when building a checkpoint).
+// ForEachLive visits newest non-deleted keys (used for stats / vacuum later).
 func (idx *Index) ForEachLive(fn func(key string, loc Loc) error) error {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
@@ -136,7 +136,6 @@ func (idx *Index) Prune(horizon uint64) {
 			delete(idx.m, k)
 			continue
 		}
-		// Collect versions newer than visible (newest-first order from head).
 		var newer []Loc
 		for v := head; v != visible; v = v.prev {
 			newer = append(newer, v.loc)
