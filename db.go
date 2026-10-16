@@ -105,6 +105,8 @@ func (db *DB) Stats() Stats {
 		MainBytes:         s.MainBytes,
 		WALBytes:          s.WALBytes,
 		ApproxDeadBytes:   s.ApproxDeadBytes,
+		CachePages:        s.CachePages,
+		DirtyFrames:       s.DirtyFrames,
 	}
 }
 

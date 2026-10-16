@@ -1,17 +1,17 @@
 // Package index is the in-RAM map from key → version chain of on-disk Locs.
-// Values themselves stay in the main file; we only store offsets here.
+// Values themselves stay in pages; we only store page addresses here.
 package index
 
 import "sync"
 
-// Loc points at one record in the main *.dorradb file.
+// Loc points at one record in a heap page (page id + slot).
 type Loc struct {
-	Offset   int64 // start of the framed record
-	Length   int64 // full frame length
-	ValueOff int64 // where the value bytes start (for ReadAt)
-	ValueLen int
-	Sequence uint64 // logical version of this entry
-	Deleted  bool   // tombstone until the next compact
+	PageID       uint32
+	Slot         uint16
+	OverflowPage uint32 // 0 if value is inline on the heap page
+	Bytes        int    // approx on-disk size for stats
+	Sequence     uint64 // logical version of this entry
+	Deleted      bool   // tombstone until vacuum / prune
 }
 
 // version is one link in a newest-first chain.
@@ -98,13 +98,13 @@ func (idx *Index) ApproxLiveBytes() int64 {
 	var n int64
 	for _, v := range idx.m {
 		if v != nil && !v.loc.Deleted {
-			n += v.loc.Length
+			n += int64(v.loc.Bytes)
 		}
 	}
 	return n
 }
 
-// ForEachLive visits newest non-deleted keys (used when building a checkpoint).
+// ForEachLive visits newest non-deleted keys (used for stats / vacuum later).
 func (idx *Index) ForEachLive(fn func(key string, loc Loc) error) error {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
@@ -136,7 +136,6 @@ func (idx *Index) Prune(horizon uint64) {
 			delete(idx.m, k)
 			continue
 		}
-		// Collect versions newer than visible (newest-first order from head).
 		var newer []Loc
 		for v := head; v != visible; v = v.prev {
 			newer = append(newer, v.loc)
@@ -167,4 +166,56 @@ func (idx *Index) MaxSequence() uint64 {
 		}
 	}
 	return max
+}
+
+// ForgetDeleted removes keys whose newest Loc is a tombstone.
+// Safe after Prune when no reader can still need those tombstones.
+func (idx *Index) ForgetDeleted() {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	for k, head := range idx.m {
+		if head != nil && head.loc.Deleted {
+			delete(idx.m, k)
+		}
+	}
+}
+
+// ReferencedSlots returns pageID → set of slots still present in any version chain.
+func (idx *Index) ReferencedSlots() map[uint32]map[uint16]struct{} {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	out := make(map[uint32]map[uint16]struct{})
+	for _, head := range idx.m {
+		for v := head; v != nil; v = v.prev {
+			if v.loc.PageID == 0 {
+				continue
+			}
+			slots := out[v.loc.PageID]
+			if slots == nil {
+				slots = make(map[uint16]struct{})
+				out[v.loc.PageID] = slots
+			}
+			slots[v.loc.Slot] = struct{}{}
+		}
+	}
+	return out
+}
+
+// RemapSlots updates Loc.Slot for every version on pageID using old→new slotMap.
+func (idx *Index) RemapSlots(pageID uint32, slotMap map[uint16]uint16) {
+	if len(slotMap) == 0 {
+		return
+	}
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	for _, head := range idx.m {
+		for v := head; v != nil; v = v.prev {
+			if v.loc.PageID != pageID {
+				continue
+			}
+			if ns, ok := slotMap[v.loc.Slot]; ok {
+				v.loc.Slot = ns
+			}
+		}
+	}
 }

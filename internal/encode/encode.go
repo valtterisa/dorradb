@@ -13,8 +13,9 @@ const (
 	Magic         uint32 = 0x41524F44
 	FileTypeMain  uint8  = 1
 	FileTypeWAL   uint8  = 2
-	FormatVersion uint8  = 1
+	FormatVersion uint8  = 2
 	HeaderSize           = 64 // fixed header at the start of main + WAL files
+	DefaultPageSize      = 4096
 
 	OpSet    uint8 = 1
 	OpDelete uint8 = 2
@@ -32,12 +33,15 @@ var (
 
 var crcTable = crc32.MakeTable(crc32.IEEE)
 
-// Header sits at offset 0 of main and WAL files.
+// Header sits at offset 0 of main and WAL files (and page 0 of the main DB).
 type Header struct {
 	FileType            uint8
 	FormatVersion       uint8
-	Sequence            uint64 // highest sequence included in this file (after compact)
+	Sequence            uint64 // highest sequence flushed to main pages
 	WalCheckpointOffset uint64 // WAL byte offset where replay should start
+	PageSize            uint32 // main file only; 0 on WAL
+	PageCount           uint32 // main file only; includes page 0
+	FreelistHead        uint32 // main file only; 0 = empty
 }
 
 func AppendU32(b []byte, v uint32) []byte {
@@ -64,6 +68,9 @@ func EncodeHeader(h Header) []byte {
 	buf[5] = h.FormatVersion
 	binary.LittleEndian.PutUint64(buf[8:16], h.Sequence)
 	binary.LittleEndian.PutUint64(buf[16:24], h.WalCheckpointOffset)
+	binary.LittleEndian.PutUint32(buf[24:28], h.PageSize)
+	binary.LittleEndian.PutUint32(buf[28:32], h.PageCount)
+	binary.LittleEndian.PutUint32(buf[32:36], h.FreelistHead)
 	sum := CRC(buf[:HeaderSize-4])
 	binary.LittleEndian.PutUint32(buf[HeaderSize-4:], sum)
 	return buf
@@ -85,6 +92,9 @@ func DecodeHeader(buf []byte) (Header, error) {
 		FormatVersion:       buf[5],
 		Sequence:            binary.LittleEndian.Uint64(buf[8:16]),
 		WalCheckpointOffset: binary.LittleEndian.Uint64(buf[16:24]),
+		PageSize:            binary.LittleEndian.Uint32(buf[24:28]),
+		PageCount:           binary.LittleEndian.Uint32(buf[28:32]),
+		FreelistHead:        binary.LittleEndian.Uint32(buf[32:36]),
 	}
 	// Version gate: refuse anything we don't understand.
 	if h.FormatVersion != FormatVersion {

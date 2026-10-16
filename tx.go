@@ -129,11 +129,14 @@ func (tx *Tx) Commit() error {
 	}
 	tx.writes = nil
 
+	// Release the snapshot pin before ApplyBatch so checkpoint/vacuum on the
+	// writer can waitPins without deadlocking against this tx.
+	tx.db.eng.Unpin(tx.snapSeq)
+
 	var err error
 	if tx.writable && len(ops) > 0 {
 		err = mapErr(tx.db.eng.ApplyBatch(ops))
 	}
-	tx.db.eng.Unpin(tx.snapSeq)
 	if tx.writable {
 		tx.db.writeMu.Unlock()
 	}

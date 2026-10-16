@@ -10,4 +10,6 @@ type Stats struct {
 	MainBytes         int64
 	WALBytes          int64
 	ApproxDeadBytes   int64
+	CachePages        int
+	DirtyFrames       int
 }
