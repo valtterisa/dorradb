@@ -1,6 +1,6 @@
 # DorraDB
 
-Embedded key-value store for Go on **Linux and Windows**. DorraDB provides **ACID transactions**. One process opens a path; values live in **4 KiB pages** on disk; an in-memory index maps keys to `(page, slot)`. Mutations are group-committed through a WAL, then applied to in-memory pages (flushed on checkpoint).
+Embedded key-value store for Go on **Linux, macOS, and Windows**. DorraDB provides **ACID transactions**. One process opens a path; values live in **4 KiB pages** on disk; an in-memory index maps keys to `(page, slot)`. Mutations are group-committed through a WAL, then applied to in-memory pages (flushed on checkpoint).
 
 **Outside pull requests are not accepted.** Open an [issue](https://github.com/valtterisa/dorradb/issues) if something is wrong, unclear, or broken — reports and discussion are welcome. Changes land from the maintainer only.
 
@@ -20,7 +20,7 @@ app.dorradb.lock    # exclusive advisory lock
 
 - [x] One writer at a time, WAL + checkpoint, exclusive file lock
 - [x] Version numbers (`sequence`) on every record
-- [x] **MVCC + multi-reader** (SQLite WAL-style) — many readers + one writer; readers use statement snapshots and don’t wait on the writer goroutine (same process)
+- [x] **MVCC + multi-reader** (SQLite WAL-style) — many readers + one writer; snapshot at `Begin` (AUTOCOMMIT ops are one-shot txs); readers don’t wait on the writer goroutine (same process)
 - [x] **ACID Transaction API** — every op is a tx (AUTOCOMMIT `Get`/`Set`, or `Begin` / `Commit` / `Rollback`); snapshot isolation; single writer; writes buffered until commit
 
 ### Reliability
@@ -70,7 +70,7 @@ transaction (AUTOCOMMIT for single `Get`/`Set`/`Delete`/`Has`, or explicit
 | `Has` | AUTOCOMMIT read tx; existence without copying the value |
 | `Begin` | Start a tx (`writable`); then `Get`/`Set`/`Delete`/`Has` on `Tx` |
 | `Tx.Commit` / `Tx.Rollback` | Apply or discard buffered writes |
-| `Stats` | Path, sequence, committed sequence, pinned readers, live keys, file sizes, approx dead bytes |
+| `Stats` | Path, sequence, committed sequence, pinned readers, live keys, file sizes, approx dead bytes, cache pages, dirty frames |
 | `Close` | Flush, unlock, close files (waits for open tx pins) |
 
 ### Transactions (ACID)
