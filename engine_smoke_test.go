@@ -126,3 +126,63 @@ func TestMainFileIsPaged(t *testing.T) {
 		t.Fatalf("size %d not multiple of 4096", info.Size())
 	}
 }
+
+func TestVacuumAfterCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.dorradb")
+	db, err := dorradb.Open(path, dorradb.Options{
+		WALCheckpointBytes: 1, // checkpoint every batch
+		VacuumDeadBytes:    1, // vacuum whenever any dead bytes
+		DisableSync:        true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	val := make([]byte, 500)
+	for i := 0; i < 30; i++ {
+		if err := db.Set([]byte{byte(i)}, val); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 30; i++ {
+		if err := db.Set([]byte{byte(i)}, []byte("x")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// One more write to trigger checkpoint+vacuum after dead data exists.
+	if err := db.Set([]byte("z"), []byte("1")); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 30; i++ {
+		got, err := db.Get([]byte{byte(i)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != "x" {
+			t.Fatalf("key %d = %q", i, got)
+		}
+	}
+	st := db.Stats()
+	if st.CachePages != 256 {
+		t.Fatalf("cache_pages=%d", st.CachePages)
+	}
+}
+
+func TestCachePagesOption(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.dorradb")
+	db, err := dorradb.Open(path, dorradb.Options{CachePages: 8, DisableSync: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Set([]byte("a"), []byte("1")); err != nil {
+		t.Fatal(err)
+	}
+	if db.Stats().CachePages != 8 {
+		t.Fatalf("got %d", db.Stats().CachePages)
+	}
+}

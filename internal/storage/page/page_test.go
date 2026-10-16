@@ -33,6 +33,36 @@ func TestHeapInsertRead(t *testing.T) {
 	}
 }
 
+func TestHeapMultiSlotStable(t *testing.T) {
+	buf := make([]byte, Size)
+	InitHeap(buf)
+	s0, err := Insert(buf, Record{Sequence: 1, Op: encode.OpSet, Key: []byte("a"), Value: []byte("1"), ValueLen: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s1, err := Insert(buf, Record{Sequence: 2, Op: encode.OpSet, Key: []byte("b"), Value: []byte("2"), ValueLen: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s0 != 0 || s1 != 1 {
+		t.Fatalf("slots %d %d", s0, s1)
+	}
+	a, _, err := ReadSlot(buf, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _, err := ReadSlot(buf, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(a.Key) != "a" || string(a.Value) != "1" {
+		t.Fatalf("slot0 %+v", a)
+	}
+	if string(b.Key) != "b" || string(b.Value) != "2" {
+		t.Fatalf("slot1 %+v", b)
+	}
+}
+
 func TestHeapOverflowRecord(t *testing.T) {
 	buf := make([]byte, Size)
 	InitHeap(buf)

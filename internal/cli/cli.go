@@ -192,6 +192,8 @@ func cmdStatus(db *dorradb.DB, jsonOut bool) int {
 	fmt.Printf("main_bytes=%d\n", s.MainBytes)
 	fmt.Printf("wal_bytes=%d\n", s.WALBytes)
 	fmt.Printf("approx_dead_bytes=%d\n", s.ApproxDeadBytes)
+	fmt.Printf("cache_pages=%d\n", s.CachePages)
+	fmt.Printf("dirty_frames=%d\n", s.DirtyFrames)
 	return ExitOK
 }
 

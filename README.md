@@ -29,7 +29,7 @@ app.dorradb.lock    # exclusive advisory lock
 
 ### Later (SQL)
 
-- [ ] **B-tree** (or equivalent) on the existing pager for ordered keys / range scans
+- [ ] **B-tree** (or equivalent) on the existing buffer pool for ordered keys / range scans
 - [ ] **Query planner**
 - [ ] **Query engine** — execute plans against the store
 - [ ] **SQL** — parser + bind to the planner/engine
@@ -95,6 +95,8 @@ db, err := dorradb.Open("app.dorradb", dorradb.Options{
     DisableSync:           true, // skip WAL fsync (faster, less durable)
     GroupCommitMaxOps:     128,
     GroupCommitMaxWait:    5 * time.Millisecond,
+    CachePages:            512,
+    VacuumDeadBytes:       16 << 20,
 })
 ```
 
@@ -105,6 +107,10 @@ db, err := dorradb.Open("app.dorradb", dorradb.Options{
 | `DisableSync` | `false` | If `true`, skip WAL fsync on group commit |
 | `GroupCommitMaxOps` | 64 | Max mutations per WAL sync |
 | `GroupCommitMaxWait` | 2ms | Max wait to coalesce writers before sync |
+| `CachePages` | 256 | Fixed buffer-pool frames (4 KiB each); min 2 |
+| `VacuumDeadBytes` | 8 MiB | Auto-vacuum after checkpoint when dead bytes reach this; `-1` disables |
+
+The buffer pool is fixed-size (`CachePages`); the main file grows in 256 KiB chunks. Keys stay in the RAM index until a future on-disk B-tree.
 
 ### Durability
 
@@ -114,7 +120,7 @@ db, err := dorradb.Open("app.dorradb", dorradb.Options{
 
 Checkpoints **flush dirty pages**, update the meta header, and truncate the WAL. Page addresses stay stable, so reader pins do not block flush. By default checkpoints run at 8 MiB of WAL growth or after 30s with mutations.
 
-Updates and deletes leave old slots until a future vacuum (`Stats.ApproxDeadBytes` approximates unused space).
+Inserts reuse free space on existing heap pages via an in-memory free-space map. Updates and deletes leave old slots until **vacuum**, which runs after checkpoint when `ApproxDeadBytes` exceeds `VacuumDeadBytes`. Vacuum waits for reader pins, prunes unreachable versions, compacts heap pages, and returns empty pages to the freelist.
 
 ### Errors
 
@@ -176,7 +182,7 @@ Exit codes: `0` ok, `1` error, `2` key not found (`get`).
 
 **`formatVersion = 2`** (v1 append-log files are not readable).
 
-**Main file:** fixed **4096-byte pages**. Page 0 is meta (64-byte header + marker): magic `DORA` (`0x41524F44`), file type (main=1), sequence, WAL checkpoint offset, page size, page count, freelist head, header CRC. Data pages use a typed header (`Heap`, `Overflow`; `BTree*` reserved). Heap pages are slotted; large values use overflow page chains.
+**Main file:** fixed **4096-byte pages**. Page 0 is meta (64-byte header + marker): magic `DORA` (`0x41524F44`), file type (main=1), sequence, WAL checkpoint offset, page size, page count, freelist head, header CRC. Data pages use a typed header (`Heap`, `Overflow`; `BTree*` reserved). Heap pages are slotted (`lower`/`upper` free space); large values use overflow page chains. Page ids are implicit (`offset = pageID × 4096`); the buffer pool keeps a `pageID → frame` directory for cached pages only.
 
 **WAL:** little-endian frames with IEEE CRC32 — length-prefixed payload + CRC. Ops: set (1), delete (2). Torn last record → crash tail; mid-file CRC → `ErrCorrupt`. Newer format versions refuse to open (`ErrUnsupportedVersion`).
 

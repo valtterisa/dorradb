@@ -19,3 +19,18 @@ func TestGetVisibleMVCC(t *testing.T) {
 		t.Fatal("expected missing after delete")
 	}
 }
+
+func TestRemapAndForgetDeleted(t *testing.T) {
+	idx := New()
+	idx.Apply([]byte("a"), Loc{PageID: 2, Slot: 5, Sequence: 1})
+	idx.RemapSlots(2, map[uint16]uint16{5: 0})
+	loc, ok := idx.Get([]byte("a"))
+	if !ok || loc.Slot != 0 {
+		t.Fatalf("got %+v", loc)
+	}
+	idx.Apply([]byte("a"), Loc{Sequence: 2, Deleted: true})
+	idx.ForgetDeleted()
+	if _, ok := idx.Get([]byte("a")); ok {
+		t.Fatal("expected forgotten")
+	}
+}

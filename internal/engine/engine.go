@@ -35,6 +35,8 @@ type Stats struct {
 	MainBytes         int64
 	WALBytes          int64
 	ApproxDeadBytes   int64
+	CachePages        int
+	DirtyFrames       int
 	LastCheckpoint    time.Time
 }
 
@@ -119,7 +121,9 @@ func Open(path string, opts Options) (*Engine, error) {
 		return nil, err
 	}
 
-	main, err := storage.OpenStore(fs, path, true)
+	main, err := storage.OpenStore(fs, path, true, storage.OpenOptions{
+		CachePages: opts.CachePages,
+	})
 	if err != nil {
 		_ = lk.Unlock()
 		return nil, err
@@ -292,13 +296,17 @@ func (e *Engine) loop() {
 }
 
 func (e *Engine) handleStats(req request) {
+	req.reply <- reply{stats: e.snapshotStats()}
+}
+
+func (e *Engine) snapshotStats() Stats {
 	live := e.idx.ApproxLiveBytes()
 	mainSize := e.main.Size()
 	dead := mainSize - int64(encode.HeaderSize) - live
 	if dead < 0 {
 		dead = 0
 	}
-	req.reply <- reply{stats: Stats{
+	return Stats{
 		Path:              e.path,
 		Sequence:          e.sequence,
 		CommittedSequence: e.committedSequence.Load(),
@@ -307,8 +315,19 @@ func (e *Engine) handleStats(req request) {
 		MainBytes:         mainSize,
 		WALBytes:          e.log.Size(),
 		ApproxDeadBytes:   dead,
+		CachePages:        e.main.CachePages(),
+		DirtyFrames:       e.main.DirtyFrames(),
 		LastCheckpoint:    e.lastCheckpoint,
-	}}
+	}
+}
+
+func (e *Engine) approxDeadBytes() int64 {
+	live := e.idx.ApproxLiveBytes()
+	dead := e.main.Size() - int64(encode.HeaderSize) - live
+	if dead < 0 {
+		return 0
+	}
+	return dead
 }
 
 func (e *Engine) handleMutations(first request) {
@@ -447,6 +466,7 @@ func (e *Engine) maybeCheckpoint() {
 
 // checkpoint flushes dirty pages, advances meta sequence / WAL offset, truncates WAL.
 // Page Locs stay stable, so reader pins do not block flush.
+// After a successful checkpoint, maybeVacuum may wait for pins and compact heap pages.
 func (e *Engine) checkpoint() error {
 	e.checkpointInFlight = true
 	defer func() { e.checkpointInFlight = false }()
@@ -466,7 +486,35 @@ func (e *Engine) checkpoint() error {
 	e.walBytesSinceCheckpoint = 0
 	e.mutationsSinceCheckpoint = false
 	e.lastCheckpoint = time.Now()
-	return nil
+	return e.maybeVacuum()
+}
+
+// maybeVacuum runs heap vacuum when dead bytes exceed the configured threshold.
+// Waits for reader pins so Loc remaps are safe.
+func (e *Engine) maybeVacuum() error {
+	if e.opts.VacuumDeadBytes <= 0 {
+		return nil
+	}
+	if e.approxDeadBytes() < e.opts.VacuumDeadBytes {
+		return nil
+	}
+	return e.vacuum()
+}
+
+func (e *Engine) vacuum() error {
+	// Wait for reader pins (not committer pins — Commit unpins before ApplyBatch).
+	e.waitPins()
+	horizon := e.committedSequence.Load()
+	e.idx.Prune(horizon)
+	if err := e.main.Vacuum(e.idx); err != nil {
+		return err
+	}
+	h := e.main.Header()
+	h.Sequence = e.sequence
+	if err := e.main.SetHeader(h); err != nil {
+		return err
+	}
+	return e.main.FlushAll()
 }
 
 func (e *Engine) finishClose(req request) {

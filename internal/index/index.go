@@ -167,3 +167,55 @@ func (idx *Index) MaxSequence() uint64 {
 	}
 	return max
 }
+
+// ForgetDeleted removes keys whose newest Loc is a tombstone.
+// Safe after Prune when no reader can still need those tombstones.
+func (idx *Index) ForgetDeleted() {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	for k, head := range idx.m {
+		if head != nil && head.loc.Deleted {
+			delete(idx.m, k)
+		}
+	}
+}
+
+// ReferencedSlots returns pageID → set of slots still present in any version chain.
+func (idx *Index) ReferencedSlots() map[uint32]map[uint16]struct{} {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	out := make(map[uint32]map[uint16]struct{})
+	for _, head := range idx.m {
+		for v := head; v != nil; v = v.prev {
+			if v.loc.PageID == 0 {
+				continue
+			}
+			slots := out[v.loc.PageID]
+			if slots == nil {
+				slots = make(map[uint16]struct{})
+				out[v.loc.PageID] = slots
+			}
+			slots[v.loc.Slot] = struct{}{}
+		}
+	}
+	return out
+}
+
+// RemapSlots updates Loc.Slot for every version on pageID using old→new slotMap.
+func (idx *Index) RemapSlots(pageID uint32, slotMap map[uint16]uint16) {
+	if len(slotMap) == 0 {
+		return
+	}
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	for _, head := range idx.m {
+		for v := head; v != nil; v = v.prev {
+			if v.loc.PageID != pageID {
+				continue
+			}
+			if ns, ok := slotMap[v.loc.Slot]; ok {
+				v.loc.Slot = ns
+			}
+		}
+	}
+}

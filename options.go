@@ -33,6 +33,15 @@ type Options struct {
 	// GroupCommitMaxWait is how long the writer waits to gather more mutations
 	// before syncing. Default: 2ms.
 	GroupCommitMaxWait time.Duration
+
+	// CachePages is the fixed buffer-pool size (4 KiB frames). Default: 256.
+	// Minimum: 2. Zero keeps the default.
+	CachePages int
+
+	// VacuumDeadBytes triggers automatic vacuum after checkpoint when
+	// ApproxDeadBytes reaches this threshold. Default: 8 MiB.
+	// Set to -1 to disable automatic vacuum.
+	VacuumDeadBytes int64
 }
 
 // DefaultOptions returns the defaults used when Open is called with no Options.
@@ -44,6 +53,8 @@ func DefaultOptions() Options {
 		DisableSync:           !e.SyncWAL,
 		GroupCommitMaxOps:     e.GroupCommitMaxOps,
 		GroupCommitMaxWait:    e.GroupCommitMaxWait,
+		CachePages:            e.CachePages,
+		VacuumDeadBytes:       e.VacuumDeadBytes,
 	}
 }
 
@@ -63,6 +74,14 @@ func (o Options) toEngine() engine.Options {
 	}
 	if o.GroupCommitMaxWait != 0 {
 		e.GroupCommitMaxWait = o.GroupCommitMaxWait
+	}
+	if o.CachePages != 0 {
+		e.CachePages = o.CachePages
+	}
+	if o.VacuumDeadBytes > 0 {
+		e.VacuumDeadBytes = o.VacuumDeadBytes
+	} else if o.VacuumDeadBytes < 0 {
+		e.VacuumDeadBytes = 0 // disable
 	}
 	return e
 }

@@ -1,5 +1,5 @@
 // Package page defines fixed-size page layouts for the main DB file.
-// Page types are extensible so B-tree nodes can share the pager later.
+// Page types are extensible so B-tree nodes can share the buffer pool later.
 package page
 
 import (
@@ -156,6 +156,8 @@ func Insert(buf []byte, r Record) (uint16, error) {
 }
 
 // ReadSlot decodes the record at slot (overflow body not followed).
+// Slot 0 is the first inserted record; directory entries grow downward from
+// the end of the page (slot s lives at Size - 2*(s+1)), matching Insert.
 func ReadSlot(buf []byte, slot uint16) (Record, int, error) {
 	if TypeOf(buf) != TypeHeap {
 		return Record{}, 0, ErrBadType
@@ -164,9 +166,9 @@ func ReadSlot(buf []byte, slot uint16) (Record, int, error) {
 	if slot >= nslots {
 		return Record{}, 0, ErrBadSlot
 	}
+	slotOff := Size - slotBytes*int(slot+1)
 	upper := int(binary.LittleEndian.Uint16(buf[hdrUpper:]))
-	slotOff := upper + int(slot)*slotBytes
-	if slotOff+slotBytes > Size {
+	if slotOff < upper || slotOff+slotBytes > Size {
 		return Record{}, 0, ErrCorrupt
 	}
 	recOff := int(binary.LittleEndian.Uint16(buf[slotOff:]))
