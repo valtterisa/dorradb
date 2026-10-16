@@ -13,12 +13,14 @@ const (
 	Magic         uint32 = 0x41524F44
 	FileTypeMain  uint8  = 1
 	FileTypeWAL   uint8  = 2
-	FormatVersion uint8  = 2
-	HeaderSize           = 64 // fixed header at the start of main + WAL files
-	DefaultPageSize      = 4096
+	FormatVersion       uint8 = 3
+	MinReadFormatVersion uint8 = 2 // v2 WALs are self-committed (no OpCommit)
+	HeaderSize                 = 64 // fixed header at the start of main + WAL files
+	DefaultPageSize            = 4096
 
 	OpSet    uint8 = 1
 	OpDelete uint8 = 2
+	OpCommit uint8 = 3 // end-of-transaction marker; empty key/value
 )
 
 var (
@@ -96,8 +98,8 @@ func DecodeHeader(buf []byte) (Header, error) {
 		PageCount:           binary.LittleEndian.Uint32(buf[28:32]),
 		FreelistHead:        binary.LittleEndian.Uint32(buf[32:36]),
 	}
-	// Version gate: refuse anything we don't understand.
-	if h.FormatVersion != FormatVersion {
+	// Version gate: accept MinReadFormatVersion..FormatVersion; refuse newer.
+	if h.FormatVersion < MinReadFormatVersion || h.FormatVersion > FormatVersion {
 		return Header{}, ErrVersion
 	}
 	return h, nil
@@ -111,7 +113,8 @@ type Record struct {
 	Value    []byte // empty for Delete
 }
 
-// Payload layout: sequence u64 | op u8 | keyLen u32 | key | valLen u32 | value
+// Payload layout: sequence u64 | op u8 | keyLen u32 | key | valLen u32 | value.
+// OpCommit uses an empty key and value; Sequence is the txn's last op sequence.
 func EncodePayload(r Record) []byte {
 	keyLen := uint32(len(r.Key))
 	valLen := uint32(len(r.Value))

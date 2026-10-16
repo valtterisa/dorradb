@@ -1,9 +1,8 @@
 // Package wal is the write-ahead log (path+"-wal").
-// Durability rule: append mutation frames, Sync, then the engine applies to main.
+// Durability rule: append mutation frames (+ OpCommit), Sync, then the engine applies to main.
 package wal
 
 import (
-	"encoding/binary"
 	"io"
 	"os"
 
@@ -13,10 +12,11 @@ import (
 
 // Log is the open WAL file.
 type Log struct {
-	fs   vfs.FS
-	path string
-	f    vfs.File
-	size int64
+	fs      vfs.FS
+	path    string
+	f       vfs.File
+	size    int64
+	version uint8
 }
 
 func PathFor(dbPath string) string {
@@ -54,6 +54,7 @@ func Open(fs vfs.FS, dbPath string, create bool) (*Log, error) {
 			return nil, err
 		}
 		w.size = encode.HeaderSize
+		w.version = encode.FormatVersion
 	} else {
 		hdr := make([]byte, encode.HeaderSize)
 		if _, err := f.ReadAt(hdr, 0); err != nil {
@@ -69,6 +70,7 @@ func Open(fs vfs.FS, dbPath string, create bool) (*Log, error) {
 			f.Close()
 			return nil, encode.ErrFileType
 		}
+		w.version = h.FormatVersion
 	}
 	return w, nil
 }
@@ -77,7 +79,10 @@ func (w *Log) Path() string { return w.path }
 
 func (w *Log) Size() int64 { return w.size }
 
-// Append writes one frame (no fsync — caller Syncs once per group).
+// Version is the on-disk FormatVersion from the WAL header.
+func (w *Log) Version() uint8 { return w.version }
+
+// Append writes one frame (no fsync — caller Syncs once per commit).
 func (w *Log) Append(rec encode.Record) (int64, int, error) {
 	frame := encode.EncodeFrame(rec)
 	off := w.size
@@ -92,7 +97,9 @@ func (w *Log) Sync() error {
 	return w.f.Sync()
 }
 
-// Replay walks frames from fromOffset to EOF. Torn last record → stop cleanly.
+// Replay walks frames from fromOffset to EOF.
+// Stops cleanly at the first frame that fails to decode (torn tail, CRC, etc.).
+// Anything after the first invalid frame is discarded on the next TruncateReset.
 func (w *Log) Replay(fromOffset int64, fn func(encode.FrameView) error) error {
 	if fromOffset < encode.HeaderSize {
 		fromOffset = encode.HeaderSize
@@ -114,20 +121,8 @@ func (w *Log) Replay(fromOffset int64, fn func(encode.FrameView) error) error {
 	for pos < len(buf) {
 		fv, n, err := encode.DecodeFrameAt(buf[pos:], off)
 		if err != nil {
-			if err == encode.ErrTorn || err == encode.ErrShort {
-				return nil
-			}
-			if err == encode.ErrCRC {
-				if pos+4 <= len(buf) {
-					plen := int(binary.LittleEndian.Uint32(buf[pos : pos+4]))
-					total := encode.FrameSize(plen)
-					if plen >= 0 && pos+total >= len(buf) {
-						return nil
-					}
-				}
-				return encode.ErrMidCRC
-			}
-			return err
+			// Stop at first invalid frame (SQLite-style). Tail is unsynced/unacked.
+			return nil
 		}
 		if err := fn(fv); err != nil {
 			return err
@@ -138,7 +133,7 @@ func (w *Log) Replay(fromOffset int64, fn func(encode.FrameView) error) error {
 	return nil
 }
 
-// TruncateReset clears the WAL after a successful checkpoint (header only).
+// TruncateReset clears the WAL after a successful checkpoint (header only, current format).
 func (w *Log) TruncateReset() error {
 	if err := w.f.Truncate(0); err != nil {
 		return err
@@ -154,6 +149,7 @@ func (w *Log) TruncateReset() error {
 		return err
 	}
 	w.size = encode.HeaderSize
+	w.version = encode.FormatVersion
 	return nil
 }
 

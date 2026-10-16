@@ -27,10 +27,19 @@ func (db *DB) Begin(writable bool) (*Tx, error) {
 	if writable {
 		db.writeMu.Lock()
 	}
+	if err := mapErr(db.eng.Err()); err != nil {
+		if writable {
+			db.writeMu.Unlock()
+		}
+		return nil, err
+	}
 	snap := db.eng.CommittedSequence()
 	if !db.eng.Pin(snap) {
 		if writable {
 			db.writeMu.Unlock()
+		}
+		if err := mapErr(db.eng.Err()); err != nil {
+			return nil, err
 		}
 		return nil, ErrClosed
 	}
@@ -129,13 +138,13 @@ func (tx *Tx) Commit() error {
 	}
 	tx.writes = nil
 
-	// Release the snapshot pin before ApplyBatch so checkpoint/vacuum on the
-	// writer can waitPins without deadlocking against this tx.
+	// Release the snapshot pin before Commit so vacuum can proceed without
+	// deadlocking against this tx (vacuum skips while pins remain).
 	tx.db.eng.Unpin(tx.snapSeq)
 
 	var err error
 	if tx.writable && len(ops) > 0 {
-		err = mapErr(tx.db.eng.ApplyBatch(ops))
+		err = mapErr(tx.db.eng.Commit(ops))
 	}
 	if tx.writable {
 		tx.db.writeMu.Unlock()

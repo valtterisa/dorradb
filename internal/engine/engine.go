@@ -1,19 +1,20 @@
 // Package engine is the single-writer core of DoraDB with same-process MVCC reads.
 //
-// Write path (Set/Delete):
+// Write path (Commit):
 //  1. queue request to the writer goroutine
-//  2. group-commit: append several WAL records, one Sync
+//  2. append WAL frames for each op + OpCommit, one Sync
 //  3. apply same records to heap pages + update RAM index
 //  4. publish committedSequence, reply OK
 //  5. maybe checkpoint (flush dirty pages, truncate WAL)
 //
 // Read path (Get/Has): pin committedSequence, GetVisible, read page slot — does not wait on writer.
 //
-// Recovery on Open: scan heap pages → replay WAL records with sequence > main max sequence.
+// Recovery on Open: scan heap pages → replay committed WAL txs (OpCommit) → checkpoint.
 package engine
 
 import (
 	"errors"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -43,14 +44,12 @@ type Stats struct {
 type opKind int
 
 const (
-	opSet opKind = iota
-	opDelete
-	opBatch
+	opCommit opKind = iota
 	opStats
 	opClose
 )
 
-// Mutation is one Set or Delete in an ApplyBatch.
+// Mutation is one Set or Delete in a Commit.
 type Mutation struct {
 	Delete bool
 	Key    []byte
@@ -59,8 +58,6 @@ type Mutation struct {
 
 type request struct {
 	kind  opKind
-	key   []byte
-	value []byte
 	batch []Mutation
 	reply chan reply
 }
@@ -87,11 +84,14 @@ type Engine struct {
 	mutationsSinceCheckpoint bool
 	checkpointInFlight       bool
 
-	pinMu    sync.Mutex
-	pinCond  *sync.Cond
-	pins     map[uint64]int // snapshotSequence → refcount
-	pinCount int
+	pinMu          sync.Mutex
+	pinCond        *sync.Cond
+	pins           map[uint64]int // snapshotSequence → refcount
+	pinCount       int
+	vacuuming      bool
+	vacuumPending  bool
 
+	fatal  atomic.Pointer[error]
 	reqCh  chan request
 	closed atomic.Bool
 	done   chan struct{}
@@ -100,15 +100,24 @@ type Engine struct {
 var (
 	ErrNotFound = errors.New("engine: not found")
 	ErrClosed   = errors.New("engine: closed")
+	// ErrFatal means an unrecoverable I/O error; Close and reopen to recover from WAL.
+	ErrFatal = errors.New("engine: fatal I/O error; close and reopen")
 )
 
-// Open locks the DB, opens main+WAL via VFS, recovers, then starts the writer loop.
+// Open locks the DB, opens main+WAL via the OS VFS, recovers, then starts the writer loop.
 func Open(path string, opts Options) (*Engine, error) {
+	return OpenWithFS(path, vfs.OS(), opts)
+}
+
+// OpenWithFS is like Open but uses fs for all durable I/O (tests / fault injection).
+func OpenWithFS(path string, fs vfs.FS, opts Options) (*Engine, error) {
 	if path == "" {
 		return nil, errors.New("engine: empty path")
 	}
+	if fs == nil {
+		fs = vfs.OS()
+	}
 	opts = opts.Normalize()
-	fs := vfs.OS()
 	dir := filepath.Dir(path)
 	if dir != "." && dir != "" {
 		if err := fs.MkdirAll(dir, 0o755); err != nil {
@@ -159,7 +168,22 @@ func Open(path string, opts Options) (*Engine, error) {
 	return e, nil
 }
 
-// recover: load index from heap pages, then replay WAL for sequences not yet on main.
+func (e *Engine) poison(err error) {
+	if err == nil {
+		return
+	}
+	wrapped := fmt.Errorf("%w: %v", ErrFatal, err)
+	e.fatal.CompareAndSwap(nil, &wrapped)
+}
+
+func (e *Engine) fatalErr() error {
+	if p := e.fatal.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
+// recover: load index from heap pages, then replay committed WAL txs.
 func (e *Engine) recover() error {
 	if err := e.main.ScanIndex(e.idx); err != nil {
 		return err
@@ -174,8 +198,11 @@ func (e *Engine) recover() error {
 	if from < encode.HeaderSize {
 		from = encode.HeaderSize
 	}
-	err := e.log.Replay(from, func(fv encode.FrameView) error {
-		rec := fv.Record
+
+	v2SelfCommit := e.log.Version() < 3
+	var pending []encode.Record
+
+	applyRec := func(rec encode.Record) error {
 		if rec.Sequence > e.sequence {
 			e.sequence = rec.Sequence
 		}
@@ -188,27 +215,39 @@ func (e *Engine) recover() error {
 		}
 		e.idx.Apply(rec.Key, loc)
 		return nil
+	}
+
+	err := e.log.Replay(from, func(fv encode.FrameView) error {
+		rec := fv.Record
+		if rec.Op == encode.OpCommit {
+			for _, r := range pending {
+				if err := applyRec(r); err != nil {
+					return err
+				}
+			}
+			pending = pending[:0]
+			if rec.Sequence > e.sequence {
+				e.sequence = rec.Sequence
+			}
+			return nil
+		}
+		if v2SelfCommit {
+			return applyRec(rec)
+		}
+		pending = append(pending, rec)
+		return nil
 	})
 	if err != nil {
 		return err
 	}
-	// Persist pages applied from WAL so a second crash does not re-apply incorrectly
-	// relative to header.Sequence — bump sequence on meta after recovery apply.
-	if e.sequence > e.main.Header().Sequence {
-		h := e.main.Header()
-		h.Sequence = e.sequence
-		if err := e.main.SetHeader(h); err != nil {
-			return err
-		}
-		if err := e.main.FlushAll(); err != nil {
-			return err
-		}
+	// Trailing uncommitted records (no OpCommit) are dropped.
+
+	// Always checkpoint after recovery so the WAL is truncated past any torn
+	// tail and main reflects the recovered sequence (fixes double-crash data loss).
+	if err := e.checkpointNoVacuum(); err != nil {
+		return err
 	}
 	e.committedSequence.Store(e.sequence)
-	e.walBytesSinceCheckpoint = e.log.Size() - encode.HeaderSize
-	if e.walBytesSinceCheckpoint < 0 {
-		e.walBytesSinceCheckpoint = 0
-	}
 	return nil
 }
 
@@ -225,11 +264,18 @@ func (e *Engine) cleanup() {
 }
 
 // Pin holds a snapshot so Prune will not drop versions the reader still needs.
+// Blocks while vacuum is in progress so readers never see half-moved slots.
 func (e *Engine) Pin(sequence uint64) bool {
 	e.pinMu.Lock()
 	defer e.pinMu.Unlock()
-	if e.closed.Load() {
-		return false
+	for {
+		if e.closed.Load() || e.fatal.Load() != nil {
+			return false
+		}
+		if !e.vacuuming {
+			break
+		}
+		e.pinCond.Wait()
 	}
 	e.pins[sequence]++
 	e.pinCount++
@@ -260,6 +306,17 @@ func (e *Engine) CommittedSequence() uint64 {
 	return e.committedSequence.Load()
 }
 
+// Err returns ErrFatal or ErrClosed if the engine is unusable, else nil.
+func (e *Engine) Err() error {
+	if err := e.fatalErr(); err != nil {
+		return err
+	}
+	if e.closed.Load() {
+		return ErrClosed
+	}
+	return nil
+}
+
 func (e *Engine) pinnedReaderCount() int {
 	e.pinMu.Lock()
 	defer e.pinMu.Unlock()
@@ -271,6 +328,27 @@ func (e *Engine) waitPins() {
 	for e.pinCount > 0 {
 		e.pinCond.Wait()
 	}
+	e.pinMu.Unlock()
+}
+
+// tryBeginVacuum returns true if vacuum may proceed (no pins). Otherwise marks
+// vacuumPending and returns false without blocking the writer.
+func (e *Engine) tryBeginVacuum() bool {
+	e.pinMu.Lock()
+	defer e.pinMu.Unlock()
+	if e.pinCount > 0 {
+		e.vacuumPending = true
+		return false
+	}
+	e.vacuuming = true
+	e.vacuumPending = false
+	return true
+}
+
+func (e *Engine) endVacuum() {
+	e.pinMu.Lock()
+	e.vacuuming = false
+	e.pinCond.Broadcast()
 	e.pinMu.Unlock()
 }
 
@@ -287,10 +365,8 @@ func (e *Engine) loop() {
 			return
 		case opStats:
 			e.handleStats(req)
-		case opBatch:
-			e.handleBatch(req)
-		case opSet, opDelete:
-			e.handleMutations(req)
+		case opCommit:
+			e.handleCommit(req)
 		}
 	}
 }
@@ -330,69 +406,20 @@ func (e *Engine) approxDeadBytes() int64 {
 	return dead
 }
 
-func (e *Engine) handleMutations(first request) {
-	group := []request{first}
-	deadline := time.Now().Add(e.opts.GroupCommitMaxWait)
-gather:
-	for len(group) < e.opts.GroupCommitMaxOps {
-		wait := time.Until(deadline)
-		if wait <= 0 {
-			break
-		}
-		timer := time.NewTimer(wait)
-		select {
-		case req := <-e.reqCh:
-			timer.Stop()
-			switch req.kind {
-			case opSet, opDelete:
-				group = append(group, req)
-			case opBatch:
-				e.applyGroup(group)
-				e.handleBatch(req)
-				return
-			case opClose:
-				e.applyGroup(group)
-				e.finishClose(req)
-				return
-			case opStats:
-				e.handleStats(req)
-			}
-		case <-timer.C:
-			break gather
-		}
+func (e *Engine) handleCommit(req request) {
+	if err := e.fatalErr(); err != nil {
+		req.reply <- reply{err: err}
+		return
 	}
-	e.applyGroup(group)
-	e.maybeCheckpoint()
-}
-
-func (e *Engine) handleBatch(req request) {
-	err := e.applyMutations(req.batch)
+	err := e.applyCommit(req.batch)
 	req.reply <- reply{err: err}
 	if err == nil {
 		e.maybeCheckpoint()
 	}
 }
 
-func (e *Engine) applyGroup(group []request) {
-	if len(group) == 0 {
-		return
-	}
-	ops := make([]Mutation, len(group))
-	for i, req := range group {
-		ops[i] = Mutation{
-			Delete: req.kind == opDelete,
-			Key:    req.key,
-			Value:  req.value,
-		}
-	}
-	err := e.applyMutations(ops)
-	for _, r := range group {
-		r.reply <- reply{err: err}
-	}
-}
-
-// applyMutations: WAL append all → Sync once → heap pages + index → publish committedSequence.
-func (e *Engine) applyMutations(ops []Mutation) error {
+// applyCommit: WAL append ops + OpCommit → Sync → heap + index → publish.
+func (e *Engine) applyCommit(ops []Mutation) error {
 	if len(ops) == 0 {
 		return nil
 	}
@@ -401,6 +428,7 @@ func (e *Engine) applyMutations(ops []Mutation) error {
 		frameLen int64
 	}
 	items := make([]prepared, 0, len(ops))
+	var totalFrameLen int64
 	for _, op := range ops {
 		e.sequence++
 		rec := encode.Record{Sequence: e.sequence, Key: op.Key}
@@ -412,13 +440,24 @@ func (e *Engine) applyMutations(ops []Mutation) error {
 		}
 		_, n, err := e.log.Append(rec)
 		if err != nil {
-			return err
+			e.poison(err)
+			return e.fatalErr()
 		}
 		items = append(items, prepared{rec: rec, frameLen: int64(n)})
+		totalFrameLen += int64(n)
 	}
+	commitSeq := e.sequence
+	_, n, err := e.log.Append(encode.Record{Sequence: commitSeq, Op: encode.OpCommit})
+	if err != nil {
+		e.poison(err)
+		return e.fatalErr()
+	}
+	totalFrameLen += int64(n)
+
 	if e.opts.SyncWAL {
 		if err := e.log.Sync(); err != nil {
-			return err
+			e.poison(err)
+			return e.fatalErr()
 		}
 	}
 
@@ -426,21 +465,25 @@ func (e *Engine) applyMutations(ops []Mutation) error {
 	for _, it := range items {
 		loc, err := e.main.Append(it.rec)
 		if err != nil {
-			return err
+			e.poison(err)
+			return e.fatalErr()
 		}
 		e.idx.Apply(it.rec.Key, loc)
 		appliedHigh = it.rec.Sequence
-		e.walBytesSinceCheckpoint += it.frameLen
-		e.mutationsSinceCheckpoint = true
 	}
+	e.walBytesSinceCheckpoint += totalFrameLen
+	e.mutationsSinceCheckpoint = true
 	e.committedSequence.Store(appliedHigh)
 	return nil
 }
 
-// ApplyBatch durably applies ops as one atomic publish.
-func (e *Engine) ApplyBatch(ops []Mutation) error {
+// Commit durably applies ops as one atomic publish (WAL OpCommit marker).
+func (e *Engine) Commit(ops []Mutation) error {
 	if len(ops) == 0 {
 		return nil
+	}
+	if err := e.fatalErr(); err != nil {
+		return err
 	}
 	batch := make([]Mutation, len(ops))
 	for i, op := range ops {
@@ -450,30 +493,40 @@ func (e *Engine) ApplyBatch(ops []Mutation) error {
 			Value:  append([]byte(nil), op.Value...),
 		}
 	}
-	return e.call(request{kind: opBatch, batch: batch}).err
+	return e.call(request{kind: opCommit, batch: batch}).err
+}
+
+// ApplyBatch is an alias for Commit (kept for transitional call sites).
+func (e *Engine) ApplyBatch(ops []Mutation) error {
+	return e.Commit(ops)
 }
 
 func (e *Engine) maybeCheckpoint() {
-	if e.checkpointInFlight || !e.mutationsSinceCheckpoint {
+	if e.checkpointInFlight {
 		return
 	}
-	bySize := e.walBytesSinceCheckpoint >= e.opts.WALCheckpointBytes
-	byTime := time.Since(e.lastCheckpoint) >= e.opts.WALCheckpointInterval
-	if bySize || byTime {
-		_ = e.checkpoint()
+	need := e.mutationsSinceCheckpoint &&
+		(e.walBytesSinceCheckpoint >= e.opts.WALCheckpointBytes ||
+			time.Since(e.lastCheckpoint) >= e.opts.WALCheckpointInterval)
+
+	e.pinMu.Lock()
+	pending := e.vacuumPending
+	e.pinMu.Unlock()
+
+	if !need && !pending {
+		return
+	}
+	if err := e.checkpoint(); err != nil {
+		e.poison(err)
 	}
 }
 
-// checkpoint flushes dirty pages, advances meta sequence / WAL offset, truncates WAL.
-// Page Locs stay stable, so reader pins do not block flush.
-// After a successful checkpoint, maybeVacuum may wait for pins and compact heap pages.
-func (e *Engine) checkpoint() error {
-	e.checkpointInFlight = true
-	defer func() { e.checkpointInFlight = false }()
-
+// checkpointNoVacuum flushes dirty pages, updates meta, truncates WAL (no vacuum).
+func (e *Engine) checkpointNoVacuum() error {
 	h := e.main.Header()
 	h.Sequence = e.sequence
 	h.WalCheckpointOffset = encode.HeaderSize
+	h.FormatVersion = encode.FormatVersion
 	if err := e.main.SetHeader(h); err != nil {
 		return err
 	}
@@ -486,24 +539,45 @@ func (e *Engine) checkpoint() error {
 	e.walBytesSinceCheckpoint = 0
 	e.mutationsSinceCheckpoint = false
 	e.lastCheckpoint = time.Now()
+	return nil
+}
+
+// checkpoint flushes dirty pages, advances meta sequence / WAL offset, truncates WAL.
+// Page Locs stay stable, so reader pins do not block flush.
+func (e *Engine) checkpoint() error {
+	e.checkpointInFlight = true
+	defer func() { e.checkpointInFlight = false }()
+
+	if e.mutationsSinceCheckpoint {
+		if err := e.checkpointNoVacuum(); err != nil {
+			return err
+		}
+	}
 	return e.maybeVacuum()
 }
 
-// maybeVacuum runs heap vacuum when dead bytes exceed the configured threshold.
-// Waits for reader pins so Loc remaps are safe.
+// maybeVacuum runs heap vacuum when dead bytes exceed the threshold, or when
+// a previous attempt was deferred (vacuumPending). Skips (does not block) when
+// readers are pinned.
 func (e *Engine) maybeVacuum() error {
 	if e.opts.VacuumDeadBytes <= 0 {
 		return nil
 	}
-	if e.approxDeadBytes() < e.opts.VacuumDeadBytes {
+	e.pinMu.Lock()
+	pending := e.vacuumPending
+	e.pinMu.Unlock()
+	if !pending && e.approxDeadBytes() < e.opts.VacuumDeadBytes {
 		return nil
 	}
 	return e.vacuum()
 }
 
 func (e *Engine) vacuum() error {
-	// Wait for reader pins (not committer pins — Commit unpins before ApplyBatch).
-	e.waitPins()
+	if !e.tryBeginVacuum() {
+		return nil
+	}
+	defer e.endVacuum()
+
 	horizon := e.committedSequence.Load()
 	e.idx.Prune(horizon)
 	if err := e.main.Vacuum(e.idx); err != nil {
@@ -520,12 +594,21 @@ func (e *Engine) vacuum() error {
 func (e *Engine) finishClose(req request) {
 	e.closed.Store(true)
 	e.waitPins()
-	_ = e.log.Sync()
-	// Flush pages so main reflects committed work.
-	h := e.main.Header()
-	h.Sequence = e.sequence
-	_ = e.main.SetHeader(h)
-	_ = e.main.FlushAll()
+
+	var err error
+	if e.fatalErr() == nil {
+		if syncErr := e.log.Sync(); err == nil {
+			err = syncErr
+		}
+		h := e.main.Header()
+		h.Sequence = e.sequence
+		if setErr := e.main.SetHeader(h); err == nil {
+			err = setErr
+		}
+		if flushErr := e.main.FlushAll(); err == nil {
+			err = flushErr
+		}
+	}
 	err1 := e.log.Close()
 	err2 := e.main.Close()
 	var err3 error
@@ -533,7 +616,9 @@ func (e *Engine) finishClose(req request) {
 		err3 = e.lk.Unlock()
 		e.lk = nil
 	}
-	err := err1
+	if err == nil {
+		err = err1
+	}
 	if err == nil {
 		err = err2
 	}
@@ -544,8 +629,14 @@ func (e *Engine) finishClose(req request) {
 }
 
 func (e *Engine) call(req request) reply {
-	if e.closed.Load() {
-		return reply{err: ErrClosed}
+	// Close must always reach the writer loop so files unlock; other ops fail fast when poisoned.
+	if req.kind != opClose {
+		if err := e.fatalErr(); err != nil {
+			return reply{err: err}
+		}
+		if e.closed.Load() {
+			return reply{err: ErrClosed}
+		}
 	}
 	req.reply = make(chan reply, 1)
 	select {
@@ -561,10 +652,16 @@ func (e *Engine) Get(key []byte) ([]byte, error) {
 }
 
 func (e *Engine) GetAt(key []byte, snapshotSequence uint64) ([]byte, error) {
+	if err := e.fatalErr(); err != nil {
+		return nil, err
+	}
 	if e.closed.Load() {
 		return nil, ErrClosed
 	}
 	if !e.Pin(snapshotSequence) {
+		if err := e.fatalErr(); err != nil {
+			return nil, err
+		}
 		return nil, ErrClosed
 	}
 	defer e.Unpin(snapshotSequence)
@@ -585,28 +682,22 @@ func (e *Engine) Has(key []byte) (bool, error) {
 }
 
 func (e *Engine) HasAt(key []byte, snapshotSequence uint64) (bool, error) {
+	if err := e.fatalErr(); err != nil {
+		return false, err
+	}
 	if e.closed.Load() {
 		return false, ErrClosed
 	}
 	if !e.Pin(snapshotSequence) {
+		if err := e.fatalErr(); err != nil {
+			return false, err
+		}
 		return false, ErrClosed
 	}
 	defer e.Unpin(snapshotSequence)
 
 	_, ok := e.idx.GetVisible(key, snapshotSequence)
 	return ok, nil
-}
-
-func (e *Engine) Set(key, value []byte) error {
-	return e.call(request{
-		kind:  opSet,
-		key:   append([]byte(nil), key...),
-		value: append([]byte(nil), value...),
-	}).err
-}
-
-func (e *Engine) Delete(key []byte) error {
-	return e.call(request{kind: opDelete, key: append([]byte(nil), key...)}).err
 }
 
 func (e *Engine) Stats() Stats {

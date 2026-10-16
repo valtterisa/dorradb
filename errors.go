@@ -13,4 +13,6 @@ var (
 	ErrUnsupportedVersion = errors.New("dorradb: unsupported format version")
 	ErrTxClosed           = errors.New("dorradb: transaction closed")
 	ErrTxNotWritable      = errors.New("dorradb: transaction is read-only")
+	// ErrFatal means an unrecoverable I/O error; Close and reopen to recover from WAL.
+	ErrFatal = errors.New("dorradb: fatal I/O error; close and reopen")
 )

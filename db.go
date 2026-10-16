@@ -131,6 +131,8 @@ func mapErr(err error) error {
 		return nil
 	}
 	switch {
+	case errors.Is(err, engine.ErrFatal):
+		return ErrFatal
 	case errors.Is(err, engine.ErrNotFound):
 		return ErrNotFound
 	case errors.Is(err, engine.ErrClosed):

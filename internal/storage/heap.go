@@ -1,6 +1,8 @@
 package storage
 
 import (
+	"sync"
+
 	"dorradb/internal/encode"
 	"dorradb/internal/index"
 	"dorradb/internal/storage/page"
@@ -8,7 +10,11 @@ import (
 )
 
 // Store is the heap access method on top of the buffer pool.
+// latch serializes writers (Append/Vacuum/ScanIndex) against concurrent readers
+// (ReadValue). Readers take RLock so they stay concurrent with each other.
 type Store struct {
+	latch sync.RWMutex
+
 	pool       *BufferPool
 	insertHint uint32         // last heap page that accepted an insert
 	freeBytes  map[uint32]int // FSM: heap pageID → FreeSpace (rebuild on open)
@@ -30,15 +36,21 @@ func (s *Store) Path() string                    { return s.pool.Path() }
 func (s *Store) Size() int64                     { return s.pool.Size() }
 func (s *Store) Header() encode.Header           { return s.pool.Header() }
 func (s *Store) SetHeader(h encode.Header) error { return s.pool.SetHeader(h) }
-func (s *Store) FlushAll() error                 { return s.pool.FlushAll() }
-func (s *Store) Close() error                    { return s.pool.Close() }
-func (s *Store) CachePages() int                 { return s.pool.CachePages() }
-func (s *Store) DirtyFrames() int                { return s.pool.DirtyFrames() }
-func (s *Store) PageCount() uint32               { return s.pool.PageCount() }
-func (s *Store) Pool() *BufferPool               { return s.pool }
+func (s *Store) FlushAll() error {
+	s.latch.RLock()
+	defer s.latch.RUnlock()
+	return s.pool.FlushAll()
+}
+func (s *Store) Close() error     { return s.pool.Close() }
+func (s *Store) CachePages() int  { return s.pool.CachePages() }
+func (s *Store) DirtyFrames() int { return s.pool.DirtyFrames() }
+func (s *Store) PageCount() uint32 { return s.pool.PageCount() }
+func (s *Store) Pool() *BufferPool { return s.pool }
 
 // Append writes a logical record onto heap pages (overflow if needed).
 func (s *Store) Append(rec encode.Record) (index.Loc, error) {
+	s.latch.Lock()
+	defer s.latch.Unlock()
 	r := page.Record{
 		Sequence: rec.Sequence,
 		Op:       rec.Op,
@@ -165,6 +177,8 @@ func (s *Store) insertHeap(r page.Record) (pageID uint32, slot uint16, nbytes in
 
 // ReadValue loads value bytes for loc (follows overflow).
 func (s *Store) ReadValue(loc index.Loc) ([]byte, error) {
+	s.latch.RLock()
+	defer s.latch.RUnlock()
 	if loc.Deleted {
 		return nil, nil
 	}
@@ -203,10 +217,13 @@ func (s *Store) readOverflow(head uint32, total int) ([]byte, error) {
 
 // ScanIndex rebuilds the RAM index and free-space map from all heap page slots.
 func (s *Store) ScanIndex(idx *index.Index) error {
+	s.latch.Lock()
+	defer s.latch.Unlock()
 	idx.Reset()
 	s.freeBytes = make(map[uint32]int)
 	s.insertHint = 0
-	for id := uint32(1); id < s.pool.hdr.PageCount; id++ {
+	pageCount := s.pool.PageCount()
+	for id := uint32(1); id < pageCount; id++ {
 		buf, err := s.pool.Get(id)
 		if err != nil {
 			return err
@@ -241,8 +258,11 @@ func (s *Store) ScanIndex(idx *index.Index) error {
 const vacuumDeadSlotRatio = 0.25
 
 // Vacuum compacts heap pages and frees unreferenced overflow/heap pages.
-// Caller must hold no reader pins and should have pruned the index first.
+// Caller must ensure no concurrent readers (engine vacuuming gate) and should
+// have pruned the index first.
 func (s *Store) Vacuum(idx *index.Index) error {
+	s.latch.Lock()
+	defer s.latch.Unlock()
 	idx.ForgetDeleted()
 	refs := idx.ReferencedSlots()
 
@@ -273,7 +293,8 @@ func (s *Store) Vacuum(idx *index.Index) error {
 		s.pool.Unpin(pageID, false)
 	}
 
-	for id := uint32(1); id < s.pool.hdr.PageCount; id++ {
+	pageCount := s.pool.PageCount()
+	for id := uint32(1); id < pageCount; id++ {
 		buf, err := s.pool.Get(id)
 		if err != nil {
 			return err
@@ -374,7 +395,8 @@ func (s *Store) Vacuum(idx *index.Index) error {
 func (s *Store) rebuildFSM() {
 	s.freeBytes = make(map[uint32]int)
 	s.insertHint = 0
-	for id := uint32(1); id < s.pool.hdr.PageCount; id++ {
+	pageCount := s.pool.PageCount()
+	for id := uint32(1); id < pageCount; id++ {
 		buf, err := s.pool.Get(id)
 		if err != nil {
 			continue
