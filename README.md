@@ -22,6 +22,7 @@ Licensed under [MIT](LICENSE).
   - [On-disk format](#on-disk-format)
   - [Reading the source](#reading-the-source)
 - [Caveats & Limitations](#caveats--limitations)
+- [Benchmarks](#benchmarks)
 - [CLI](#cli)
 - [Goals](#goals)
 - [Contributing](#contributing)
@@ -294,6 +295,16 @@ Useful entry points if you want to see how the pieces connect:
 - **Underfull leaves are not merged.** Deletes leave space until vacuum / reuse patterns catch up.
 - **Overflow pages** written just before a crash can leak as unused space (not corruption).
 - **Reliability bar for production** (crash/recovery stress, fuzz, backup, verify, format migrations) is still in progress — see Goals.
+
+## Benchmarks
+
+```bash
+go run ./cmd/bench           # writes + reads vs bbolt
+go run ./cmd/bench writes
+go run ./cmd/bench reads
+```
+
+Raw Go benches: [`bench/`](bench/).
 
 ## CLI
 
