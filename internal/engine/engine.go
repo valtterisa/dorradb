@@ -3,13 +3,13 @@
 // Write path (Set/Delete):
 //  1. queue request to the writer goroutine
 //  2. group-commit: append several WAL records, one Sync
-//  3. apply same records to heap pages + update RAM index
+//  3. apply same records to the clustered B+ tree
 //  4. publish committedSequence, reply OK
 //  5. maybe checkpoint (flush dirty pages, truncate WAL)
 //
-// Read path (Get/Has): pin committedSequence, GetVisible, read page slot — does not wait on writer.
+// Read path (Get/Has): pin committedSequence, tree.GetVisible — does not wait on writer.
 //
-// Recovery on Open: scan heap pages → replay WAL records with sequence > main max sequence.
+// Recovery on Open: load table root → replay WAL records with sequence > main header sequence.
 package engine
 
 import (
@@ -19,8 +19,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"dorradb/internal/btree"
 	"dorradb/internal/encode"
-	"dorradb/internal/index"
 	"dorradb/internal/storage"
 	"dorradb/internal/vfs"
 	"dorradb/internal/wal"
@@ -70,17 +70,18 @@ type reply struct {
 	err   error
 }
 
-// Engine owns the lock, main store, WAL, index, and the writer loop.
+// Engine owns the lock, main store, WAL, table tree, and the writer loop.
 type Engine struct {
 	path  string
 	fs    vfs.FS
 	lk    vfs.Lock
 	main  *storage.Store
 	log   *wal.Log
-	idx   *index.Index
+	tree  *btree.Tree
 	opts  Options
 
-	sequence                 uint64 // next mutation gets sequence+1 (writer-only)
+	sequence                 uint64 // last sequence handed out (writer-only)
+	appliedSequence          uint64 // last sequence applied to the tree (writer-only)
 	committedSequence        atomic.Uint64
 	walBytesSinceCheckpoint  int64
 	lastCheckpoint           time.Time
@@ -89,7 +90,7 @@ type Engine struct {
 
 	pinMu    sync.Mutex
 	pinCond  *sync.Cond
-	pins     map[uint64]int // snapshotSequence → refcount
+	pins     map[uint64]int
 	pinCount int
 
 	reqCh  chan request
@@ -135,13 +136,21 @@ func Open(path string, opts Options) (*Engine, error) {
 		return nil, err
 	}
 
+	tree, err := btree.Open(main.Pool())
+	if err != nil {
+		_ = log.Close()
+		_ = main.Close()
+		_ = lk.Unlock()
+		return nil, err
+	}
+
 	e := &Engine{
 		path:           path,
 		fs:             fs,
 		lk:             lk,
 		main:           main,
 		log:            log,
-		idx:            index.New(),
+		tree:           tree,
 		opts:           opts,
 		lastCheckpoint: time.Now(),
 		pins:           make(map[uint64]int),
@@ -149,6 +158,7 @@ func Open(path string, opts Options) (*Engine, error) {
 		done:           make(chan struct{}),
 	}
 	e.pinCond = sync.NewCond(&e.pinMu)
+	tree.SetFlusher(e.flushPages)
 
 	if err := e.recover(); err != nil {
 		e.cleanup()
@@ -159,52 +169,47 @@ func Open(path string, opts Options) (*Engine, error) {
 	return e, nil
 }
 
-// recover: load index from heap pages, then replay WAL for sequences not yet on main.
+// recover replays WAL records newer than the last flush. The main file holds
+// exactly the tree as of header.Sequence (pages only reach disk via whole,
+// journaled flushes), so everything after it comes from the WAL.
 func (e *Engine) recover() error {
-	if err := e.main.ScanIndex(e.idx); err != nil {
-		return err
-	}
-	maxMainSequence := e.idx.MaxSequence()
-	if hseq := e.main.Header().Sequence; hseq > maxMainSequence {
-		maxMainSequence = hseq
-	}
-	e.sequence = maxMainSequence
+	flushed := e.main.Header().Sequence
+	e.sequence = flushed
+	e.appliedSequence = flushed
 
 	from := int64(e.main.Header().WalCheckpointOffset)
 	if from < encode.HeaderSize {
 		from = encode.HeaderSize
 	}
+	const noReaders = ^uint64(0)
 	err := e.log.Replay(from, func(fv encode.FrameView) error {
 		rec := fv.Record
 		if rec.Sequence > e.sequence {
 			e.sequence = rec.Sequence
 		}
-		if rec.Sequence <= maxMainSequence {
+		if rec.Sequence <= flushed {
 			return nil
 		}
-		loc, aerr := e.main.Append(rec)
-		if aerr != nil {
-			return aerr
+		var err error
+		if rec.Op == encode.OpDelete {
+			err = e.tree.Delete(rec.Key, rec.Sequence, noReaders)
+		} else {
+			err = e.tree.Put(rec.Key, rec.Value, rec.Sequence, noReaders)
 		}
-		e.idx.Apply(rec.Key, loc)
-		return nil
+		if err == nil {
+			e.appliedSequence = rec.Sequence
+		}
+		return err
 	})
 	if err != nil {
 		return err
 	}
-	// Persist pages applied from WAL so a second crash does not re-apply incorrectly
-	// relative to header.Sequence — bump sequence on meta after recovery apply.
-	if e.sequence > e.main.Header().Sequence {
-		h := e.main.Header()
-		h.Sequence = e.sequence
-		if err := e.main.SetHeader(h); err != nil {
-			return err
-		}
-		if err := e.main.FlushAll(); err != nil {
+	if e.appliedSequence > flushed {
+		if err := e.flushPages(); err != nil {
 			return err
 		}
 	}
-	e.committedSequence.Store(e.sequence)
+	e.committedSequence.Store(e.appliedSequence)
 	e.walBytesSinceCheckpoint = e.log.Size() - encode.HeaderSize
 	if e.walBytesSinceCheckpoint < 0 {
 		e.walBytesSinceCheckpoint = 0
@@ -224,7 +229,35 @@ func (e *Engine) cleanup() {
 	}
 }
 
-// Pin holds a snapshot so Prune will not drop versions the reader still needs.
+// flushPages writes all dirty pages with the header describing exactly what
+// they contain (applied sequence + root). The WAL is left alone.
+func (e *Engine) flushPages() error {
+	h := e.main.Header()
+	h.Sequence = e.appliedSequence
+	h.TableRoot = e.tree.Root()
+	if err := e.main.SetHeader(h); err != nil {
+		return err
+	}
+	return e.main.FlushAll()
+}
+
+func (e *Engine) CommittedSequence() uint64 { return e.committedSequence.Load() }
+
+// PinLatest pins the newest committed snapshot and returns it. Loading and
+// pinning happen under one lock so pruning can never race between them.
+func (e *Engine) PinLatest() (uint64, bool) {
+	e.pinMu.Lock()
+	defer e.pinMu.Unlock()
+	if e.closed.Load() {
+		return 0, false
+	}
+	seq := e.committedSequence.Load()
+	e.pins[seq]++
+	e.pinCount++
+	return seq, true
+}
+
+// Pin holds a snapshot the caller already has pinned, so pruning keeps its versions.
 func (e *Engine) Pin(sequence uint64) bool {
 	e.pinMu.Lock()
 	defer e.pinMu.Unlock()
@@ -236,7 +269,19 @@ func (e *Engine) Pin(sequence uint64) bool {
 	return true
 }
 
-// Unpin releases a Pin. Extra Unpin calls are a no-op (no underflow).
+// pruneHorizon is the oldest snapshot any reader may still use.
+func (e *Engine) pruneHorizon() uint64 {
+	e.pinMu.Lock()
+	defer e.pinMu.Unlock()
+	h := e.committedSequence.Load()
+	for seq := range e.pins {
+		if seq < h {
+			h = seq
+		}
+	}
+	return h
+}
+
 func (e *Engine) Unpin(sequence uint64) {
 	e.pinMu.Lock()
 	defer e.pinMu.Unlock()
@@ -255,23 +300,18 @@ func (e *Engine) Unpin(sequence uint64) {
 	}
 }
 
-// CommittedSequence is the last sequence fully published to readers.
-func (e *Engine) CommittedSequence() uint64 {
-	return e.committedSequence.Load()
-}
-
-func (e *Engine) pinnedReaderCount() int {
-	e.pinMu.Lock()
-	defer e.pinMu.Unlock()
-	return e.pinCount
-}
-
 func (e *Engine) waitPins() {
 	e.pinMu.Lock()
 	for e.pinCount > 0 {
 		e.pinCond.Wait()
 	}
 	e.pinMu.Unlock()
+}
+
+func (e *Engine) pinnedReaderCount() int {
+	e.pinMu.Lock()
+	defer e.pinMu.Unlock()
+	return e.pinCount
 }
 
 func (e *Engine) loop() {
@@ -300,7 +340,7 @@ func (e *Engine) handleStats(req request) {
 }
 
 func (e *Engine) snapshotStats() Stats {
-	live := e.idx.ApproxLiveBytes()
+	live := e.tree.ApproxLiveBytes()
 	mainSize := e.main.Size()
 	dead := mainSize - int64(encode.HeaderSize) - live
 	if dead < 0 {
@@ -311,7 +351,7 @@ func (e *Engine) snapshotStats() Stats {
 		Sequence:          e.sequence,
 		CommittedSequence: e.committedSequence.Load(),
 		PinnedReaders:     e.pinnedReaderCount(),
-		LiveKeys:          e.idx.LiveCount(),
+		LiveKeys:          e.tree.LiveCount(),
 		MainBytes:         mainSize,
 		WALBytes:          e.log.Size(),
 		ApproxDeadBytes:   dead,
@@ -322,12 +362,20 @@ func (e *Engine) snapshotStats() Stats {
 }
 
 func (e *Engine) approxDeadBytes() int64 {
-	live := e.idx.ApproxLiveBytes()
+	live := e.tree.ApproxLiveBytes()
 	dead := e.main.Size() - int64(encode.HeaderSize) - live
 	if dead < 0 {
 		return 0
 	}
 	return dead
+}
+
+func (e *Engine) handleBatch(req request) {
+	err := e.applyMutations(req.batch)
+	req.reply <- reply{err: err}
+	if err == nil {
+		e.maybeCheckpoint()
+	}
 }
 
 func (e *Engine) handleMutations(first request) {
@@ -365,14 +413,6 @@ gather:
 	e.maybeCheckpoint()
 }
 
-func (e *Engine) handleBatch(req request) {
-	err := e.applyMutations(req.batch)
-	req.reply <- reply{err: err}
-	if err == nil {
-		e.maybeCheckpoint()
-	}
-}
-
 func (e *Engine) applyGroup(group []request) {
 	if len(group) == 0 {
 		return
@@ -391,7 +431,7 @@ func (e *Engine) applyGroup(group []request) {
 	}
 }
 
-// applyMutations: WAL append all → Sync once → heap pages + index → publish committedSequence.
+// applyMutations: WAL append all → Sync once → tree Put/Delete → publish committedSequence.
 func (e *Engine) applyMutations(ops []Mutation) error {
 	if len(ops) == 0 {
 		return nil
@@ -422,18 +462,24 @@ func (e *Engine) applyMutations(ops []Mutation) error {
 		}
 	}
 
-	var appliedHigh uint64
+	// New readers pin at committedSequence or later, so this horizon stays
+	// valid for the whole batch.
+	horizon := e.pruneHorizon()
 	for _, it := range items {
-		loc, err := e.main.Append(it.rec)
+		var err error
+		if it.rec.Op == encode.OpDelete {
+			err = e.tree.Delete(it.rec.Key, it.rec.Sequence, horizon)
+		} else {
+			err = e.tree.Put(it.rec.Key, it.rec.Value, it.rec.Sequence, horizon)
+		}
 		if err != nil {
 			return err
 		}
-		e.idx.Apply(it.rec.Key, loc)
-		appliedHigh = it.rec.Sequence
+		e.appliedSequence = it.rec.Sequence
 		e.walBytesSinceCheckpoint += it.frameLen
 		e.mutationsSinceCheckpoint = true
 	}
-	e.committedSequence.Store(appliedHigh)
+	e.committedSequence.Store(e.appliedSequence)
 	return nil
 }
 
@@ -464,20 +510,11 @@ func (e *Engine) maybeCheckpoint() {
 	}
 }
 
-// checkpoint flushes dirty pages, advances meta sequence / WAL offset, truncates WAL.
-// Page Locs stay stable, so reader pins do not block flush.
-// After a successful checkpoint, maybeVacuum may wait for pins and compact heap pages.
 func (e *Engine) checkpoint() error {
 	e.checkpointInFlight = true
 	defer func() { e.checkpointInFlight = false }()
 
-	h := e.main.Header()
-	h.Sequence = e.sequence
-	h.WalCheckpointOffset = encode.HeaderSize
-	if err := e.main.SetHeader(h); err != nil {
-		return err
-	}
-	if err := e.main.FlushAll(); err != nil {
+	if err := e.flushPages(); err != nil {
 		return err
 	}
 	if err := e.log.TruncateReset(); err != nil {
@@ -489,8 +526,6 @@ func (e *Engine) checkpoint() error {
 	return e.maybeVacuum()
 }
 
-// maybeVacuum runs heap vacuum when dead bytes exceed the configured threshold.
-// Waits for reader pins so Loc remaps are safe.
 func (e *Engine) maybeVacuum() error {
 	if e.opts.VacuumDeadBytes <= 0 {
 		return nil
@@ -502,30 +537,18 @@ func (e *Engine) maybeVacuum() error {
 }
 
 func (e *Engine) vacuum() error {
-	// Wait for reader pins (not committer pins — Commit unpins before ApplyBatch).
 	e.waitPins()
-	horizon := e.committedSequence.Load()
-	e.idx.Prune(horizon)
-	if err := e.main.Vacuum(e.idx); err != nil {
+	if err := e.tree.Prune(e.committedSequence.Load(), true); err != nil {
 		return err
 	}
-	h := e.main.Header()
-	h.Sequence = e.sequence
-	if err := e.main.SetHeader(h); err != nil {
-		return err
-	}
-	return e.main.FlushAll()
+	return e.flushPages()
 }
 
 func (e *Engine) finishClose(req request) {
 	e.closed.Store(true)
 	e.waitPins()
 	_ = e.log.Sync()
-	// Flush pages so main reflects committed work.
-	h := e.main.Header()
-	h.Sequence = e.sequence
-	_ = e.main.SetHeader(h)
-	_ = e.main.FlushAll()
+	_ = e.flushPages()
 	err1 := e.log.Close()
 	err2 := e.main.Close()
 	var err3 error
@@ -557,44 +580,53 @@ func (e *Engine) call(req request) reply {
 }
 
 func (e *Engine) Get(key []byte) ([]byte, error) {
-	return e.GetAt(key, e.committedSequence.Load())
-}
-
-func (e *Engine) GetAt(key []byte, snapshotSequence uint64) ([]byte, error) {
-	if e.closed.Load() {
+	snap, ok := e.PinLatest()
+	if !ok {
 		return nil, ErrClosed
 	}
+	defer e.Unpin(snap)
+	return e.getAt(key, snap)
+}
+
+// GetAt reads at snapshotSequence, which the caller must already hold pinned.
+func (e *Engine) GetAt(key []byte, snapshotSequence uint64) ([]byte, error) {
 	if !e.Pin(snapshotSequence) {
 		return nil, ErrClosed
 	}
 	defer e.Unpin(snapshotSequence)
+	return e.getAt(key, snapshotSequence)
+}
 
-	loc, ok := e.idx.GetVisible(key, snapshotSequence)
-	if !ok {
-		return nil, ErrNotFound
-	}
-	val, err := e.main.ReadValue(loc)
+func (e *Engine) getAt(key []byte, snapshotSequence uint64) ([]byte, error) {
+	val, ok, err := e.tree.GetVisible(key, snapshotSequence)
 	if err != nil {
 		return nil, err
 	}
-	return append([]byte(nil), val...), nil
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return val, nil
 }
 
 func (e *Engine) Has(key []byte) (bool, error) {
-	return e.HasAt(key, e.committedSequence.Load())
-}
-
-func (e *Engine) HasAt(key []byte, snapshotSequence uint64) (bool, error) {
-	if e.closed.Load() {
+	snap, ok := e.PinLatest()
+	if !ok {
 		return false, ErrClosed
 	}
+	defer e.Unpin(snap)
+	_, found, err := e.tree.GetVisible(key, snap)
+	return found, err
+}
+
+// HasAt checks existence at snapshotSequence, which the caller must already hold pinned.
+func (e *Engine) HasAt(key []byte, snapshotSequence uint64) (bool, error) {
 	if !e.Pin(snapshotSequence) {
 		return false, ErrClosed
 	}
 	defer e.Unpin(snapshotSequence)
 
-	_, ok := e.idx.GetVisible(key, snapshotSequence)
-	return ok, nil
+	_, ok, err := e.tree.GetVisible(key, snapshotSequence)
+	return ok, err
 }
 
 func (e *Engine) Set(key, value []byte) error {

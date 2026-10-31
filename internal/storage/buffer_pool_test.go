@@ -1,11 +1,11 @@
 package storage
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 
 	"dorradb/internal/encode"
-	"dorradb/internal/index"
 	"dorradb/internal/storage/page"
 	"dorradb/internal/vfs"
 )
@@ -59,136 +59,6 @@ func TestBufferPoolGetDirtyFlush(t *testing.T) {
 	}
 }
 
-func TestStoreAppendReadScan(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "t.dorradb")
-	s, err := OpenStore(vfs.OS(), path, true, OpenOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-
-	loc, err := s.Append(encode.Record{
-		Sequence: 1,
-		Op:       encode.OpSet,
-		Key:      []byte("a"),
-		Value:    []byte("1"),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	val, err := s.ReadValue(loc)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(val) != "1" {
-		t.Fatalf("val=%q", val)
-	}
-	if err := s.FlushAll(); err != nil {
-		t.Fatal(err)
-	}
-
-	idx := index.New()
-	if err := s.ScanIndex(idx); err != nil {
-		t.Fatal(err)
-	}
-	got, ok := idx.Get([]byte("a"))
-	if !ok || got.Sequence != 1 {
-		t.Fatalf("index %+v ok=%v", got, ok)
-	}
-}
-
-func TestStoreOverflowValue(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "t.dorradb")
-	s, err := OpenStore(vfs.OS(), path, true, OpenOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-
-	big := make([]byte, 10000)
-	for i := range big {
-		big[i] = byte(i)
-	}
-	loc, err := s.Append(encode.Record{
-		Sequence: 1,
-		Op:       encode.OpSet,
-		Key:      []byte("big"),
-		Value:    big,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if loc.OverflowPage == 0 {
-		t.Fatal("expected overflow")
-	}
-	val, err := s.ReadValue(loc)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(val) != len(big) {
-		t.Fatalf("len=%d", len(val))
-	}
-	for i := range big {
-		if val[i] != big[i] {
-			t.Fatalf("mismatch at %d", i)
-		}
-	}
-}
-
-func TestBufferPoolSmallCacheManyPages(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "t.dorradb")
-	s, err := OpenStore(vfs.OS(), path, true, OpenOptions{CachePages: 4, GrowPages: 8})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-
-	var locs []index.Loc
-	for i := 0; i < 20; i++ {
-		loc, err := s.Append(encode.Record{
-			Sequence: uint64(i + 1),
-			Op:       encode.OpSet,
-			Key:      []byte{byte(i)},
-			Value:    []byte("v"),
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		locs = append(locs, loc)
-	}
-	if err := s.FlushAll(); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	s2, err := OpenStore(vfs.OS(), path, false, OpenOptions{CachePages: 4})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s2.Close()
-	idx := index.New()
-	if err := s2.ScanIndex(idx); err != nil {
-		t.Fatal(err)
-	}
-	for i, loc := range locs {
-		got, err := s2.ReadValue(loc)
-		if err != nil {
-			t.Fatalf("i=%d: %v", i, err)
-		}
-		if string(got) != "v" {
-			t.Fatalf("i=%d val=%q", i, got)
-		}
-		if _, ok := idx.Get([]byte{byte(i)}); !ok {
-			t.Fatalf("missing key %d", i)
-		}
-	}
-}
-
 func TestBufferPoolDirtyEvictionWriteback(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "t.dorradb")
@@ -209,19 +79,24 @@ func TestBufferPoolDirtyEvictionWriteback(t *testing.T) {
 	}
 	p.Unpin(id1, true)
 
-	// Allocate more pages than cache to force eviction of dirty id1.
 	id2, _, err := p.NewPage(page.InitHeap)
 	if err != nil {
 		t.Fatal(err)
 	}
 	p.Unpin(id2, true)
+	// No-steal: both frames are dirty, so nothing can be evicted until a flush.
+	if _, _, err := p.NewPage(page.InitHeap); err != ErrNoFreeFrame {
+		t.Fatalf("got %v want ErrNoFreeFrame", err)
+	}
+	if err := p.FlushAll(); err != nil {
+		t.Fatal(err)
+	}
 	id3, _, err := p.NewPage(page.InitHeap)
 	if err != nil {
 		t.Fatal(err)
 	}
 	p.Unpin(id3, true)
 
-	// id1 should have been written back; load fresh and read.
 	buf, err := p.Get(id1)
 	if err != nil {
 		t.Fatal(err)
@@ -270,143 +145,114 @@ func TestBufferPoolRejectSmallCache(t *testing.T) {
 	}
 }
 
-func TestFSMReusesEarlierPage(t *testing.T) {
+func TestUnflushedPagesNeverReachDisk(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "t.dorradb")
-	s, err := OpenStore(vfs.OS(), path, true, OpenOptions{})
+	p, err := Open(vfs.OS(), path, true, OpenOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
-
-	// Fill first heap page nearly full with medium values.
-	val := make([]byte, 200)
-	var seq uint64 = 1
-	var firstPage uint32
-	for {
-		loc, err := s.Append(encode.Record{
-			Sequence: seq,
-			Op:       encode.OpSet,
-			Key:      []byte{byte(seq)},
-			Value:    val,
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if firstPage == 0 {
-			firstPage = loc.PageID
-		}
-		if loc.PageID != firstPage {
-			break
-		}
-		seq++
-		if seq > 100 {
-			t.Fatal("expected page to fill")
-		}
-	}
-	secondPage := s.insertHint
-	if secondPage == firstPage {
-		t.Fatal("expected second page")
-	}
-
-	// Force hint to a page with no advertised free space so FSM first-fit
-	// must pick firstPage's leftover gap.
-	s.insertHint = secondPage
-	s.freeBytes[secondPage] = 0
-	buf, err := s.pool.Get(firstPage)
+	id, buf, err := p.NewPage(page.InitHeap)
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.freeBytes[firstPage] = page.FreeSpace(buf)
-	s.pool.Unpin(firstPage, false)
-	if s.freeBytes[firstPage] < 32 {
-		t.Skip("first page has no leftover gap; FSM reuse N/A for this packing")
-	}
+	buf[100] = 0xAB
+	p.Unpin(id, true)
+	h := p.Header()
+	h.TableRoot = id
+	_ = p.SetHeader(h)
 
-	loc, err := s.Append(encode.Record{
-		Sequence: seq + 1,
-		Op:       encode.OpSet,
-		Key:      []byte("tiny"),
-		Value:    []byte("x"),
-	})
+	// Without a flush the main file must still be the empty meta page.
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loc.PageID != firstPage {
-		t.Fatalf("expected reuse page %d, got %d", firstPage, loc.PageID)
+	onDisk, err := page.DecodeMetaPage(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if onDisk.PageCount != 1 || onDisk.TableRoot != 0 {
+		t.Fatalf("meta leaked to disk before flush: %+v", onDisk)
+	}
+	_ = p.Close()
+}
+
+func TestTornJournalIsIgnored(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "t.dorradb")
+	p, err := Open(vfs.OS(), path, true, OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = p.Close()
+	before, _ := os.ReadFile(path)
+
+	torn := encodeJournal([]journalEntry{{pageID: 0, data: make([]byte, page.Size)}})
+	if err := os.WriteFile(JournalPath(path), torn[:len(torn)-10], 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p2, err := Open(vfs.OS(), path, false, OpenOptions{})
+	if err != nil {
+		t.Fatalf("open with torn journal: %v", err)
+	}
+	_ = p2.Close()
+	after, _ := os.ReadFile(path)
+	if string(before[:page.Size]) != string(after[:page.Size]) {
+		t.Fatal("torn journal was applied")
+	}
+	if _, err := os.Stat(JournalPath(path)); !os.IsNotExist(err) {
+		t.Fatal("journal not removed")
 	}
 }
 
-func TestVacuumCompactsDeadSlots(t *testing.T) {
+func TestCompleteJournalIsReplayed(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "t.dorradb")
+	p, err := Open(vfs.OS(), path, true, OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := p.Header()
+	_ = p.Close()
+
+	// Simulate a crash after the journal fsync but before main was written.
+	h.Sequence = 42
+	if err := os.WriteFile(JournalPath(path), encodeJournal([]journalEntry{{pageID: 0, data: page.EncodeMetaPage(h)}}), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p2, err := Open(vfs.OS(), path, false, OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p2.Close()
+	if p2.Header().Sequence != 42 {
+		t.Fatalf("journal not replayed: seq=%d", p2.Header().Sequence)
+	}
+}
+
+func TestHeaderTableRoot(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "t.dorradb")
 	s, err := OpenStore(vfs.OS(), path, true, OpenOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
-
-	idx := index.New()
-	const n = 40
-	val := make([]byte, 80)
-	for i := 0; i < n; i++ {
-		loc, err := s.Append(encode.Record{
-			Sequence: uint64(i + 1),
-			Op:       encode.OpSet,
-			Key:      []byte{byte(i)},
-			Value:    val,
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		idx.Apply([]byte{byte(i)}, loc)
-	}
-	// Overwrite every key (dead slots accumulate).
-	for i := 0; i < n; i++ {
-		loc, err := s.Append(encode.Record{
-			Sequence: uint64(n + i + 1),
-			Op:       encode.OpSet,
-			Key:      []byte{byte(i)},
-			Value:    []byte("x"),
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		idx.Apply([]byte{byte(i)}, loc)
-	}
-
-	pagesBefore := s.PageCount()
-	idx.Prune(uint64(2 * n))
-	idx.ForgetDeleted()
-	if err := s.Vacuum(idx); err != nil {
+	h := s.Header()
+	h.TableRoot = 7
+	if err := s.SetHeader(h); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.FlushAll(); err != nil {
 		t.Fatal(err)
 	}
+	_ = s.Close()
 
-	for i := 0; i < n; i++ {
-		loc, ok := idx.Get([]byte{byte(i)})
-		if !ok {
-			t.Fatalf("missing %d", i)
-		}
-		got, err := s.ReadValue(loc)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if string(got) != "x" {
-			t.Fatalf("key %d = %q", i, got)
-		}
+	s2, err := OpenStore(vfs.OS(), path, false, OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
 	}
-	// Freelist should have absorbed some empty pages, or FSM free space increased.
-	if s.Header().FreelistHead == 0 && s.PageCount() >= pagesBefore {
-		// Still OK if compact kept same page count but freed space inside pages.
-		totalFree := 0
-		for _, f := range s.freeBytes {
-			totalFree += f
-		}
-		if totalFree == 0 {
-			t.Fatal("expected freelist or free space after vacuum")
-		}
+	defer s2.Close()
+	if s2.Header().TableRoot != 7 {
+		t.Fatalf("TableRoot=%d", s2.Header().TableRoot)
 	}
 }

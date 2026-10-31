@@ -1,5 +1,5 @@
 // Package page defines fixed-size page layouts for the main DB file.
-// Page types are extensible so B-tree nodes can share the buffer pool later.
+// Heap helpers remain for tests/legacy; primary data uses B-tree page types.
 package page
 
 import (

@@ -13,7 +13,7 @@ const (
 	Magic         uint32 = 0x41524F44
 	FileTypeMain  uint8  = 1
 	FileTypeWAL   uint8  = 2
-	FormatVersion uint8  = 2
+	FormatVersion uint8  = 3
 	HeaderSize           = 64 // fixed header at the start of main + WAL files
 	DefaultPageSize      = 4096
 
@@ -42,6 +42,7 @@ type Header struct {
 	PageSize            uint32 // main file only; 0 on WAL
 	PageCount           uint32 // main file only; includes page 0
 	FreelistHead        uint32 // main file only; 0 = empty
+	TableRoot           uint32 // main file only; clustered B+ tree root page id (0 = none)
 }
 
 func AppendU32(b []byte, v uint32) []byte {
@@ -71,6 +72,7 @@ func EncodeHeader(h Header) []byte {
 	binary.LittleEndian.PutUint32(buf[24:28], h.PageSize)
 	binary.LittleEndian.PutUint32(buf[28:32], h.PageCount)
 	binary.LittleEndian.PutUint32(buf[32:36], h.FreelistHead)
+	binary.LittleEndian.PutUint32(buf[36:40], h.TableRoot)
 	sum := CRC(buf[:HeaderSize-4])
 	binary.LittleEndian.PutUint32(buf[HeaderSize-4:], sum)
 	return buf
@@ -95,6 +97,7 @@ func DecodeHeader(buf []byte) (Header, error) {
 		PageSize:            binary.LittleEndian.Uint32(buf[24:28]),
 		PageCount:           binary.LittleEndian.Uint32(buf[28:32]),
 		FreelistHead:        binary.LittleEndian.Uint32(buf[32:36]),
+		TableRoot:           binary.LittleEndian.Uint32(buf[36:40]),
 	}
 	// Version gate: refuse anything we don't understand.
 	if h.FormatVersion != FormatVersion {

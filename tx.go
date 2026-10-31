@@ -27,8 +27,8 @@ func (db *DB) Begin(writable bool) (*Tx, error) {
 	if writable {
 		db.writeMu.Lock()
 	}
-	snap := db.eng.CommittedSequence()
-	if !db.eng.Pin(snap) {
+	snap, ok := db.eng.PinLatest()
+	if !ok {
 		if writable {
 			db.writeMu.Unlock()
 		}

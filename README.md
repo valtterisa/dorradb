@@ -1,6 +1,6 @@
 # DorraDB
 
-Embedded key-value store for Go on **Linux, macOS, and Windows**. DorraDB provides **ACID transactions**. One process opens a path; values live in **4 KiB pages** on disk; an in-memory index maps keys to `(page, slot)`. Mutations are group-committed through a WAL, then applied to in-memory pages (flushed on checkpoint).
+Embedded key-value store for Go on **Linux, macOS, and Windows**. DorraDB provides **ACID transactions**. One process opens a path; rows live in a **clustered B+ tree** on **4 KiB pages** (leaf cells hold versioned key/value data). Mutations are group-committed through a WAL, then applied to dirty tree pages (flushed on checkpoint).
 
 **Outside pull requests are not accepted.** Open an [issue](https://github.com/valtterisa/dorradb/issues) if something is wrong, unclear, or broken — reports and discussion are welcome. Changes land from the maintainer only.
 
@@ -9,8 +9,9 @@ Licensed under [MIT](LICENSE).
 OS I/O goes through an internal VFS (stdlib + [`gofrs/flock`](https://github.com/gofrs/flock)). Engine code only sees `vfs.FS`.
 
 ```text
-app.dorradb         # main database (4 KiB pages; heap records + overflow)
+app.dorradb         # main database (4 KiB pages; table B+ tree + overflow)
 app.dorradb-wal     # write-ahead log
+app.dorradb-journal # page redo journal, exists only during a page flush
 app.dorradb.lock    # exclusive advisory lock
 ```
 
@@ -29,7 +30,7 @@ app.dorradb.lock    # exclusive advisory lock
 
 ### Later (SQL)
 
-- [ ] **B-tree** (or equivalent) on the existing buffer pool for ordered keys / range scans
+- [x] **Clustered B+ tree** on the buffer pool (primary table; ordered keys / range scans)
 - [ ] **Query planner**
 - [ ] **Query engine** — execute plans against the store
 - [ ] **SQL** — parser + bind to the planner/engine
@@ -110,17 +111,21 @@ db, err := dorradb.Open("app.dorradb", dorradb.Options{
 | `CachePages` | 256 | Fixed buffer-pool frames (4 KiB each); min 2 |
 | `VacuumDeadBytes` | 8 MiB | Auto-vacuum after checkpoint when dead bytes reach this; `-1` disables |
 
-The buffer pool is fixed-size (`CachePages`); the main file grows in 256 KiB chunks. Keys stay in the RAM index until a future on-disk B-tree.
+The buffer pool is fixed-size (`CachePages`); the main file grows in 256 KiB chunks. The primary store is a clustered B+ tree (`TableRoot` in the meta header).
 
 ### Durability
 
 1. Mutations are **group-committed** to the WAL and fsynced (unless `DisableSync`).
-2. Then applied to **in-memory pages** (marked dirty) and the RAM version index; then `committedSequence` is published and the call returns.
-3. On open after a crash: scan heap pages into the RAM index, then replay WAL records with sequence greater than the main file’s max sequence.
+2. Then applied to **dirty B+ tree / overflow pages**; then `committedSequence` is published and the call returns.
+3. On open after a crash: replay a complete `-journal` if one exists (a torn one is discarded), load the table root, then replay WAL records with sequence greater than the main file’s flushed sequence.
 
-Checkpoints **flush dirty pages**, update the meta header, and truncate the WAL. Page addresses stay stable, so reader pins do not block flush. By default checkpoints run at 8 MiB of WAL growth or after 30s with mutations.
+The buffer pool is **no-steal**: dirty pages are never evicted, and the meta header is only written as part of a flush. Every flush is atomic: all dirty pages plus the meta page (recording the applied sequence and `TableRoot`) go to the `-journal` file first, which is fsynced, then into the main file, which is fsynced, and then the journal is removed. So the main file always holds one complete, consistent tree, and the WAL covers everything after it. When the cache runs low, the tree flushes on its own between operations, so `CachePages` limits memory, not write volume.
 
-Inserts reuse free space on existing heap pages via an in-memory free-space map. Updates and deletes leave old slots until **vacuum**, which runs after checkpoint when `ApproxDeadBytes` exceeds `VacuumDeadBytes`. Vacuum waits for reader pins, prunes unreachable versions, compacts heap pages, and returns empty pages to the freelist.
+Checkpoints flush and then truncate the WAL. By default checkpoints run at 8 MiB of WAL growth or after 30s with mutations.
+
+Updates and deletes add MVCC versions inside leaf cells. On every write, versions no reader can see anymore (older than the oldest pinned snapshot) are dropped from that cell. Large values spill to overflow pages. **Vacuum** (after checkpoint when `ApproxDeadBytes` exceeds `VacuumDeadBytes`) prunes the whole tree and drops tombstoned keys.
+
+Limits: a single key can hold only around 60–100 versions that open snapshots still need (`ErrTooBig` after that), so long-lived transactions on a hot key will eventually fail writes. Underfull leaves are not merged. Overflow pages written just before a crash can leak (unused space, not corruption).
 
 ### Errors
 
@@ -180,9 +185,9 @@ Exit codes: `0` ok, `1` error, `2` key not found (`get`).
 
 ## On-disk format
 
-**`formatVersion = 2`** (v1 append-log files are not readable).
+**`formatVersion = 3`** (v1/v2 files are not readable).
 
-**Main file:** fixed **4096-byte pages**. Page 0 is meta (64-byte header + marker): magic `DORA` (`0x41524F44`), file type (main=1), sequence, WAL checkpoint offset, page size, page count, freelist head, header CRC. Data pages use a typed header (`Heap`, `Overflow`; `BTree*` reserved). Heap pages are slotted (`lower`/`upper` free space); large values use overflow page chains. Page ids are implicit (`offset = pageID × 4096`); the buffer pool keeps a `pageID → frame` directory for cached pages only.
+**Main file:** fixed **4096-byte pages**. Page 0 is meta (64-byte header + marker): magic `DORA` (`0x41524F44`), file type (main=1), sequence, WAL checkpoint offset, page size, page count, freelist head, **table root**, header CRC. Data pages: clustered **B+ tree** leaf/internal nodes; large values use overflow page chains. Page ids are implicit (`offset = pageID × 4096`); the buffer pool keeps a `pageID → frame` directory for cached pages only.
 
 **WAL:** little-endian frames with IEEE CRC32 — length-prefixed payload + CRC. Ops: set (1), delete (2). Torn last record → crash tail; mid-file CRC → `ErrCorrupt`. Newer format versions refuse to open (`ErrUnsupportedVersion`).
 
