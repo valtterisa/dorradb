@@ -59,15 +59,8 @@ type sepEntry struct {
 	Child uint32 // child for keys >= Key
 }
 
-func InitLeaf(buf []byte) {
-	initNode(buf, page.TypeBTreeLeaf)
-}
-
-func InitInternal(buf []byte) {
-	initNode(buf, page.TypeBTreeInternal)
-}
-
-func initNode(buf []byte, typ uint8) {
+// Init zeroes buf as a leaf or internal B+ tree page (typ = page.TypeBTree*).
+func Init(buf []byte, typ uint8) {
 	if len(buf) < page.Size {
 		panic("btree: short page")
 	}
@@ -308,7 +301,7 @@ func writeLeaf(buf []byte, cells []Cell, sibling uint32) error {
 	if !leafFits(cells) {
 		return ErrPageFull
 	}
-	InitLeaf(buf)
+	Init(buf, page.TypeBTreeLeaf)
 	SetRightSibling(buf, sibling)
 	for _, c := range cells {
 		if err := appendEntry(buf, encodeCell(c)); err != nil {
@@ -412,7 +405,7 @@ func writeInternal(buf []byte, left uint32, seps []sepEntry) error {
 	if !internalFits(seps) {
 		return ErrPageFull
 	}
-	InitInternal(buf)
+	Init(buf, page.TypeBTreeInternal)
 	SetLeftChild(buf, left)
 	for _, s := range seps {
 		if err := appendEntry(buf, encodeSep(s)); err != nil {

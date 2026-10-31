@@ -6,6 +6,7 @@ import (
 
 	"dorradb/internal/encode"
 	"dorradb/internal/engine"
+	"dorradb/internal/storage/page"
 	"dorradb/internal/vfs"
 )
 
@@ -139,7 +140,8 @@ func mapErr(err error) error {
 		return ErrLocked
 	case errors.Is(err, encode.ErrVersion):
 		return ErrUnsupportedVersion
-	case errors.Is(err, encode.ErrMidCRC), errors.Is(err, encode.ErrCRC), errors.Is(err, encode.ErrMagic), errors.Is(err, encode.ErrFileType):
+	case errors.Is(err, encode.ErrMidCRC), errors.Is(err, encode.ErrCRC), errors.Is(err, encode.ErrMagic), errors.Is(err, encode.ErrFileType),
+		errors.Is(err, page.ErrCorrupt), errors.Is(err, page.ErrShort):
 		return ErrCorrupt
 	default:
 		return err

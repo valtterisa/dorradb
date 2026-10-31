@@ -1,6 +1,10 @@
 package btree
 
-import "bytes"
+import (
+	"bytes"
+
+	"dorradb/internal/storage/page"
+)
 
 // splitLeaf writes cells (which no longer fit in one page) across left and a
 // new right leaf, split by bytes. Returns the separator (smallest key on the
@@ -14,7 +18,7 @@ func (t *Tree) splitLeaf(left []byte, cells []Cell) (sepKey []byte, rightID uint
 	if !ok {
 		return nil, 0, ErrTooBig
 	}
-	rightID, right, err := t.pool.NewPage(InitLeaf)
+	rightID, right, err := t.pool.NewPage(func(b []byte) { Init(b, page.TypeBTreeLeaf) })
 	if err != nil {
 		return nil, 0, err
 	}
@@ -65,7 +69,7 @@ func (t *Tree) promote(path []uint32, sepKey []byte, rightChild uint32) error {
 		}
 	}
 
-	rootID, rootBuf, err := t.pool.NewPage(InitInternal)
+	rootID, rootBuf, err := t.pool.NewPage(func(b []byte) { Init(b, page.TypeBTreeInternal) })
 	if err != nil {
 		return err
 	}
@@ -89,7 +93,7 @@ func (t *Tree) splitInternal(buf []byte, leftChild uint32, seps []sepEntry) (sep
 	if !ok {
 		return nil, 0, ErrTooBig
 	}
-	rightID, right, err := t.pool.NewPage(InitInternal)
+	rightID, right, err := t.pool.NewPage(func(b []byte) { Init(b, page.TypeBTreeInternal) })
 	if err != nil {
 		return nil, 0, err
 	}

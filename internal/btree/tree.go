@@ -26,7 +26,7 @@ func Open(pool *storage.BufferPool) (*Tree, error) {
 	t := &Tree{pool: pool, root: pool.Header().TableRoot}
 	t.flush = pool.FlushAll
 	if t.root == 0 {
-		id, _, err := pool.NewPage(InitLeaf)
+		id, _, err := pool.NewPage(func(b []byte) { Init(b, page.TypeBTreeLeaf) })
 		if err != nil {
 			return nil, err
 		}

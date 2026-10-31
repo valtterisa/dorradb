@@ -154,6 +154,24 @@ func Open(fs vfs.FS, dbPath string, create bool, opts OpenOptions) (*BufferPool,
 		return p, nil
 	}
 
+	// Pre-v3 files were append-only (< 4 KiB). Peek the header so callers get
+	// ErrVersion instead of a bare EOF from a short ReadAt of page 0.
+	if info.Size() < int64(page.Size) {
+		if info.Size() >= encode.HeaderSize {
+			hdr := make([]byte, encode.HeaderSize)
+			if _, err := f.ReadAt(hdr, 0); err != nil {
+				_ = f.Close()
+				return nil, err
+			}
+			if _, err := encode.DecodeHeader(hdr); err != nil {
+				_ = f.Close()
+				return nil, err
+			}
+		}
+		_ = f.Close()
+		return nil, page.ErrCorrupt
+	}
+
 	meta := make([]byte, page.Size)
 	if _, err := f.ReadAt(meta, 0); err != nil {
 		_ = f.Close()
