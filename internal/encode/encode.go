@@ -45,18 +45,6 @@ type Header struct {
 	TableRoot           uint32 // main file only; clustered B+ tree root page id (0 = none)
 }
 
-func AppendU32(b []byte, v uint32) []byte {
-	var tmp [4]byte
-	binary.LittleEndian.PutUint32(tmp[:], v)
-	return append(b, tmp[:]...)
-}
-
-func AppendU64(b []byte, v uint64) []byte {
-	var tmp [8]byte
-	binary.LittleEndian.PutUint64(tmp[:], v)
-	return append(b, tmp[:]...)
-}
-
 func CRC(data []byte) uint32 {
 	return crc32.Checksum(data, crcTable)
 }
@@ -120,11 +108,11 @@ func EncodePayload(r Record) []byte {
 	valLen := uint32(len(r.Value))
 	n := 8 + 1 + 4 + len(r.Key) + 4 + len(r.Value)
 	buf := make([]byte, 0, n)
-	buf = AppendU64(buf, r.Sequence)
+	buf = binary.LittleEndian.AppendUint64(buf, r.Sequence)
 	buf = append(buf, r.Op)
-	buf = AppendU32(buf, keyLen)
+	buf = binary.LittleEndian.AppendUint32(buf, keyLen)
 	buf = append(buf, r.Key...)
-	buf = AppendU32(buf, valLen)
+	buf = binary.LittleEndian.AppendUint32(buf, valLen)
 	buf = append(buf, r.Value...)
 	return buf
 }
@@ -160,9 +148,9 @@ func DecodePayload(p []byte) (Record, error) {
 func EncodeFrame(r Record) []byte {
 	payload := EncodePayload(r)
 	frame := make([]byte, 0, 4+len(payload)+4)
-	frame = AppendU32(frame, uint32(len(payload)))
+	frame = binary.LittleEndian.AppendUint32(frame, uint32(len(payload)))
 	frame = append(frame, payload...)
-	frame = AppendU32(frame, CRC(payload))
+	frame = binary.LittleEndian.AppendUint32(frame, CRC(payload))
 	return frame
 }
 

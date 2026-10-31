@@ -14,16 +14,8 @@ type Options struct {
 	// passed with mutations since the last checkpoint. Default: 30s.
 	WALCheckpointInterval time.Duration
 
-	// SyncWAL fsyncs the WAL on each group commit. Default: true.
+	// SyncWAL fsyncs the WAL on each commit batch. Default: true.
 	SyncWAL bool
-
-	// GroupCommitMaxOps is the max mutations coalesced into one WAL sync.
-	// Default: 64.
-	GroupCommitMaxOps int
-
-	// GroupCommitMaxWait is how long the writer waits to gather more mutations
-	// before syncing. Default: 2ms.
-	GroupCommitMaxWait time.Duration
 
 	// CachePages is the fixed buffer-pool frame count. Default: 256. Minimum: 2.
 	CachePages int
@@ -39,8 +31,6 @@ func DefaultOptions() Options {
 		WALCheckpointBytes:    8 << 20,
 		WALCheckpointInterval: 30 * time.Second,
 		SyncWAL:               true,
-		GroupCommitMaxOps:     64,
-		GroupCommitMaxWait:    2 * time.Millisecond,
 		CachePages:            256,
 		VacuumDeadBytes:       8 << 20,
 	}
@@ -57,12 +47,6 @@ func (o Options) Normalize() Options {
 	}
 	if o.WALCheckpointInterval == 0 {
 		o.WALCheckpointInterval = d.WALCheckpointInterval
-	}
-	if o.GroupCommitMaxOps == 0 {
-		o.GroupCommitMaxOps = d.GroupCommitMaxOps
-	}
-	if o.GroupCommitMaxWait == 0 {
-		o.GroupCommitMaxWait = d.GroupCommitMaxWait
 	}
 	if o.CachePages == 0 {
 		o.CachePages = d.CachePages

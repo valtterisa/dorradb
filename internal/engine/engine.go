@@ -43,9 +43,7 @@ type Stats struct {
 type opKind int
 
 const (
-	opSet opKind = iota
-	opDelete
-	opBatch
+	opBatch opKind = iota
 	opStats
 	opClose
 )
@@ -59,8 +57,6 @@ type Mutation struct {
 
 type request struct {
 	kind  opKind
-	key   []byte
-	value []byte
 	batch []Mutation
 	reply chan reply
 }
@@ -75,7 +71,7 @@ type Engine struct {
 	path  string
 	fs    vfs.FS
 	lk    vfs.Lock
-	main  *storage.Store
+	main  *storage.BufferPool
 	log   *wal.Log
 	tree  *btree.Tree
 	opts  Options
@@ -122,7 +118,7 @@ func Open(path string, opts Options) (*Engine, error) {
 		return nil, err
 	}
 
-	main, err := storage.OpenStore(fs, path, true, storage.OpenOptions{
+	main, err := storage.Open(fs, path, true, storage.OpenOptions{
 		CachePages: opts.CachePages,
 	})
 	if err != nil {
@@ -136,7 +132,7 @@ func Open(path string, opts Options) (*Engine, error) {
 		return nil, err
 	}
 
-	tree, err := btree.Open(main.Pool())
+	tree, err := btree.Open(main)
 	if err != nil {
 		_ = log.Close()
 		_ = main.Close()
@@ -241,8 +237,6 @@ func (e *Engine) flushPages() error {
 	return e.main.FlushAll()
 }
 
-func (e *Engine) CommittedSequence() uint64 { return e.committedSequence.Load() }
-
 // PinLatest pins the newest committed snapshot and returns it. Loading and
 // pinning happen under one lock so pruning can never race between them.
 func (e *Engine) PinLatest() (uint64, bool) {
@@ -329,8 +323,6 @@ func (e *Engine) loop() {
 			e.handleStats(req)
 		case opBatch:
 			e.handleBatch(req)
-		case opSet, opDelete:
-			e.handleMutations(req)
 		}
 	}
 }
@@ -375,59 +367,6 @@ func (e *Engine) handleBatch(req request) {
 	req.reply <- reply{err: err}
 	if err == nil {
 		e.maybeCheckpoint()
-	}
-}
-
-func (e *Engine) handleMutations(first request) {
-	group := []request{first}
-	deadline := time.Now().Add(e.opts.GroupCommitMaxWait)
-gather:
-	for len(group) < e.opts.GroupCommitMaxOps {
-		wait := time.Until(deadline)
-		if wait <= 0 {
-			break
-		}
-		timer := time.NewTimer(wait)
-		select {
-		case req := <-e.reqCh:
-			timer.Stop()
-			switch req.kind {
-			case opSet, opDelete:
-				group = append(group, req)
-			case opBatch:
-				e.applyGroup(group)
-				e.handleBatch(req)
-				return
-			case opClose:
-				e.applyGroup(group)
-				e.finishClose(req)
-				return
-			case opStats:
-				e.handleStats(req)
-			}
-		case <-timer.C:
-			break gather
-		}
-	}
-	e.applyGroup(group)
-	e.maybeCheckpoint()
-}
-
-func (e *Engine) applyGroup(group []request) {
-	if len(group) == 0 {
-		return
-	}
-	ops := make([]Mutation, len(group))
-	for i, req := range group {
-		ops[i] = Mutation{
-			Delete: req.kind == opDelete,
-			Key:    req.key,
-			Value:  req.value,
-		}
-	}
-	err := e.applyMutations(ops)
-	for _, r := range group {
-		r.reply <- reply{err: err}
 	}
 }
 
@@ -579,25 +518,8 @@ func (e *Engine) call(req request) reply {
 	}
 }
 
-func (e *Engine) Get(key []byte) ([]byte, error) {
-	snap, ok := e.PinLatest()
-	if !ok {
-		return nil, ErrClosed
-	}
-	defer e.Unpin(snap)
-	return e.getAt(key, snap)
-}
-
 // GetAt reads at snapshotSequence, which the caller must already hold pinned.
 func (e *Engine) GetAt(key []byte, snapshotSequence uint64) ([]byte, error) {
-	if !e.Pin(snapshotSequence) {
-		return nil, ErrClosed
-	}
-	defer e.Unpin(snapshotSequence)
-	return e.getAt(key, snapshotSequence)
-}
-
-func (e *Engine) getAt(key []byte, snapshotSequence uint64) ([]byte, error) {
 	val, ok, err := e.tree.GetVisible(key, snapshotSequence)
 	if err != nil {
 		return nil, err
@@ -608,37 +530,10 @@ func (e *Engine) getAt(key []byte, snapshotSequence uint64) ([]byte, error) {
 	return val, nil
 }
 
-func (e *Engine) Has(key []byte) (bool, error) {
-	snap, ok := e.PinLatest()
-	if !ok {
-		return false, ErrClosed
-	}
-	defer e.Unpin(snap)
-	_, found, err := e.tree.GetVisible(key, snap)
-	return found, err
-}
-
 // HasAt checks existence at snapshotSequence, which the caller must already hold pinned.
 func (e *Engine) HasAt(key []byte, snapshotSequence uint64) (bool, error) {
-	if !e.Pin(snapshotSequence) {
-		return false, ErrClosed
-	}
-	defer e.Unpin(snapshotSequence)
-
 	_, ok, err := e.tree.GetVisible(key, snapshotSequence)
 	return ok, err
-}
-
-func (e *Engine) Set(key, value []byte) error {
-	return e.call(request{
-		kind:  opSet,
-		key:   append([]byte(nil), key...),
-		value: append([]byte(nil), value...),
-	}).err
-}
-
-func (e *Engine) Delete(key []byte) error {
-	return e.call(request{kind: opDelete, key: append([]byte(nil), key...)}).err
 }
 
 func (e *Engine) Stats() Stats {

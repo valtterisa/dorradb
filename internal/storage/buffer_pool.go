@@ -247,13 +247,13 @@ type journalEntry struct {
 // Journal layout: magic u32 | count u32 | (pageID u32 | page bytes)* | crc32.
 func encodeJournal(entries []journalEntry) []byte {
 	buf := make([]byte, 0, 8+len(entries)*(4+page.Size)+4)
-	buf = encode.AppendU32(buf, journalMagic)
-	buf = encode.AppendU32(buf, uint32(len(entries)))
+	buf = binary.LittleEndian.AppendUint32(buf, journalMagic)
+	buf = binary.LittleEndian.AppendUint32(buf, uint32(len(entries)))
 	for _, e := range entries {
-		buf = encode.AppendU32(buf, e.pageID)
+		buf = binary.LittleEndian.AppendUint32(buf, e.pageID)
 		buf = append(buf, e.data...)
 	}
-	return encode.AppendU32(buf, encode.CRC(buf))
+	return binary.LittleEndian.AppendUint32(buf, encode.CRC(buf))
 }
 
 func decodeJournal(buf []byte) ([]journalEntry, bool) {

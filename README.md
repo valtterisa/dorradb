@@ -168,8 +168,6 @@ db, err := dorradb.Open("app.dorradb", dorradb.Options{
 	WALCheckpointBytes:    32 << 20,
 	WALCheckpointInterval: 60 * time.Second,
 	DisableSync:           true, // skip WAL fsync (faster, less durable)
-	GroupCommitMaxOps:     128,
-	GroupCommitMaxWait:    5 * time.Millisecond,
 	CachePages:            512,
 	VacuumDeadBytes:       16 << 20,
 })
@@ -179,9 +177,7 @@ db, err := dorradb.Open("app.dorradb", dorradb.Options{
 | --- | --- | --- |
 | `WALCheckpointBytes` | 8 MiB | Checkpoint when WAL growth reaches this size |
 | `WALCheckpointInterval` | 30s | Checkpoint after this long with mutations |
-| `DisableSync` | `false` | If `true`, skip WAL fsync on group commit |
-| `GroupCommitMaxOps` | 64 | Max mutations per WAL sync |
-| `GroupCommitMaxWait` | 2ms | Max wait to coalesce writers before sync |
+| `DisableSync` | `false` | If `true`, skip WAL fsync on commit |
 | `CachePages` | 256 | Fixed buffer-pool frames (4 KiB each); min 2 |
 | `VacuumDeadBytes` | 8 MiB | Auto-vacuum after checkpoint when dead bytes reach this; `-1` disables |
 
@@ -261,7 +257,7 @@ Reads at snapshot `S` walk the chain and take the newest version with `sequence 
 
 ### WAL, buffer pool, and checkpoints
 
-1. **Mutations** are **group-committed** to the WAL and fsynced (unless `DisableSync`).
+1. **Mutations** in a commit are appended to the WAL and fsynced once (unless `DisableSync`).
 2. They are then applied to **dirty B+ tree / overflow pages** in the buffer pool; `committedSequence` is published and the call returns.
 3. Later, a **checkpoint** flushes dirty pages to the main file and truncates the WAL (by default at 8 MiB growth or after 30s with mutations).
 
@@ -282,7 +278,7 @@ Reads at snapshot `S` walk the chain and take the newest version with `sequence 
 Useful entry points if you want to see how the pieces connect:
 
 - `Open` / `DB` / `Tx` — public API (`db.go`, `tx.go`)
-- `internal/engine` — group commit, pins, checkpoint, vacuum orchestration
+- `internal/engine` — WAL apply, pins, checkpoint, vacuum orchestration
 - `internal/btree` — clustered B+ tree, splits, versioned leaf cells
 - `internal/storage` — buffer pool, pager, journal flush
 - `internal/wal` — append-only log frames

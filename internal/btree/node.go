@@ -70,13 +70,6 @@ func Init(buf []byte, typ uint8) {
 	binary.LittleEndian.PutUint16(buf[hdrUpper:], page.Size)
 }
 
-func TypeOf(buf []byte) uint8 {
-	if len(buf) < 1 {
-		return 0
-	}
-	return buf[hdrType]
-}
-
 func NKeys(buf []byte) int {
 	return int(binary.LittleEndian.Uint16(buf[hdrNKeys:]))
 }
@@ -240,7 +233,7 @@ func decodeCell(buf []byte, off int) (Cell, error) {
 }
 
 func ReadLeafCell(buf []byte, i int) (Cell, error) {
-	if TypeOf(buf) != page.TypeBTreeLeaf {
+	if page.TypeOf(buf) != page.TypeBTreeLeaf {
 		return Cell{}, ErrBadType
 	}
 	off, err := cellOffset(buf, i)
@@ -252,7 +245,7 @@ func ReadLeafCell(buf []byte, i int) (Cell, error) {
 
 // SearchLeaf returns the index of key, or where it would be inserted, and found.
 func SearchLeaf(buf []byte, key []byte) (idx int, found bool, err error) {
-	if TypeOf(buf) != page.TypeBTreeLeaf {
+	if page.TypeOf(buf) != page.TypeBTreeLeaf {
 		return 0, false, ErrBadType
 	}
 	lo, hi := 0, NKeys(buf)
@@ -351,7 +344,7 @@ func readSep(buf []byte, i int) (sepEntry, error) {
 // SearchInternal returns the child covering key: leftChild if key < sep[0],
 // else the child of the last separator <= key.
 func SearchInternal(buf []byte, key []byte) (uint32, error) {
-	if TypeOf(buf) != page.TypeBTreeInternal {
+	if page.TypeOf(buf) != page.TypeBTreeInternal {
 		return 0, ErrBadType
 	}
 	lo, hi := 0, NKeys(buf) // find first sep > key
@@ -378,7 +371,7 @@ func SearchInternal(buf []byte, key []byte) (uint32, error) {
 }
 
 func sepsFromInternal(buf []byte) (left uint32, seps []sepEntry, err error) {
-	if TypeOf(buf) != page.TypeBTreeInternal {
+	if page.TypeOf(buf) != page.TypeBTreeInternal {
 		return 0, nil, ErrBadType
 	}
 	n := NKeys(buf)

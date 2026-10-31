@@ -22,17 +22,9 @@ type Options struct {
 	// mutations since the last checkpoint. Default: 30s.
 	WALCheckpointInterval time.Duration
 
-	// DisableSync skips fsync of the WAL on each group commit. Faster writes,
+	// DisableSync skips fsync of the WAL on each commit. Faster writes,
 	// but a crash may lose recently acknowledged mutations. Default: false (sync on).
 	DisableSync bool
-
-	// GroupCommitMaxOps is how many Sets/Deletes may share one WAL sync.
-	// Default: 64.
-	GroupCommitMaxOps int
-
-	// GroupCommitMaxWait is how long the writer waits to gather more mutations
-	// before syncing. Default: 2ms.
-	GroupCommitMaxWait time.Duration
 
 	// CachePages is the fixed buffer-pool size (4 KiB frames). Default: 256.
 	// Minimum: 2. Zero keeps the default.
@@ -51,8 +43,6 @@ func DefaultOptions() Options {
 		WALCheckpointBytes:    e.WALCheckpointBytes,
 		WALCheckpointInterval: e.WALCheckpointInterval,
 		DisableSync:           !e.SyncWAL,
-		GroupCommitMaxOps:     e.GroupCommitMaxOps,
-		GroupCommitMaxWait:    e.GroupCommitMaxWait,
 		CachePages:            e.CachePages,
 		VacuumDeadBytes:       e.VacuumDeadBytes,
 	}
@@ -68,12 +58,6 @@ func (o Options) toEngine() engine.Options {
 	}
 	if o.DisableSync {
 		e.SyncWAL = false
-	}
-	if o.GroupCommitMaxOps != 0 {
-		e.GroupCommitMaxOps = o.GroupCommitMaxOps
-	}
-	if o.GroupCommitMaxWait != 0 {
-		e.GroupCommitMaxWait = o.GroupCommitMaxWait
 	}
 	if o.CachePages != 0 {
 		e.CachePages = o.CachePages

@@ -13,13 +13,13 @@ import (
 func TestBufferPoolGetDirtyFlush(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "t.dorradb")
-	s, err := OpenStore(vfs.OS(), path, true, OpenOptions{})
+	s, err := Open(vfs.OS(), path, true, OpenOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close()
 
-	id, buf, err := s.pool.NewPage(page.InitHeap)
+	id, buf, err := s.NewPage(page.InitHeap)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,25 +32,25 @@ func TestBufferPoolGetDirtyFlush(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	s.pool.Unpin(id, true)
-	if err := s.pool.FlushAll(); err != nil {
+	s.Unpin(id, true)
+	if err := s.FlushAll(); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	s2, err := OpenStore(vfs.OS(), path, false, OpenOptions{})
+	s2, err := Open(vfs.OS(), path, false, OpenOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s2.Close()
-	buf2, err := s2.pool.Get(id)
+	buf2, err := s2.Get(id)
 	if err != nil {
 		t.Fatal(err)
 	}
 	rec, _, err := page.ReadSlot(buf2, 0)
-	s2.pool.Unpin(id, false)
+	s2.Unpin(id, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,7 +233,7 @@ func TestCompleteJournalIsReplayed(t *testing.T) {
 func TestHeaderTableRoot(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "t.dorradb")
-	s, err := OpenStore(vfs.OS(), path, true, OpenOptions{})
+	s, err := Open(vfs.OS(), path, true, OpenOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -247,7 +247,7 @@ func TestHeaderTableRoot(t *testing.T) {
 	}
 	_ = s.Close()
 
-	s2, err := OpenStore(vfs.OS(), path, false, OpenOptions{})
+	s2, err := Open(vfs.OS(), path, false, OpenOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

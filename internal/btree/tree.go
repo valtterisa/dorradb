@@ -79,7 +79,7 @@ func (t *Tree) descend(key []byte) (path []uint32, leafID uint32, leaf []byte, e
 		if err != nil {
 			return nil, 0, nil, err
 		}
-		switch TypeOf(buf) {
+		switch page.TypeOf(buf) {
 		case page.TypeBTreeLeaf:
 			return path, id, buf, nil
 		case page.TypeBTreeInternal:
@@ -337,7 +337,7 @@ func (t *Tree) leftmostLeaf() (uint32, error) {
 		if err != nil {
 			return 0, err
 		}
-		typ, child := TypeOf(buf), LeftChild(buf)
+		typ, child := page.TypeOf(buf), LeftChild(buf)
 		t.pool.Unpin(id, false)
 		switch typ {
 		case page.TypeBTreeLeaf:

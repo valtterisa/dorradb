@@ -117,7 +117,7 @@ func TestSplitHeight(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rootType := TypeOf(buf)
+	rootType := page.TypeOf(buf)
 	p.Unpin(tr.Root(), false)
 	if rootType != page.TypeBTreeInternal {
 		t.Fatalf("expected internal root, got type=%d", rootType)
@@ -340,7 +340,7 @@ func checkTree(t *testing.T, tr *Tree) {
 		inBounds := func(k []byte) bool {
 			return (lo == nil || bytes.Compare(k, lo) >= 0) && (hi == nil || bytes.Compare(k, hi) < 0)
 		}
-		switch TypeOf(buf) {
+		switch page.TypeOf(buf) {
 		case page.TypeBTreeLeaf:
 			if leafDepth == -1 {
 				leafDepth = depth
@@ -375,7 +375,7 @@ func checkTree(t *testing.T, tr *Tree) {
 			}
 			walk(child, childLo, hi, depth+1)
 		default:
-			t.Fatalf("page %d has type %d", id, TypeOf(buf))
+			t.Fatalf("page %d has type %d", id, page.TypeOf(buf))
 		}
 	}
 	walk(tr.Root(), nil, nil, 0)
