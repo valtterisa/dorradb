@@ -17,6 +17,10 @@ Licensed under [MIT](LICENSE).
   - [Options](#options)
   - [Statistics](#statistics)
 - [How DorraDB works](#how-dorradb-works)
+  - [Clustered B+ tree](#clustered-b-tree)
+  - [WAL, buffer pool, and checkpoints](#wal-buffer-pool-and-checkpoints)
+  - [On-disk format](#on-disk-format)
+  - [Reading the source](#reading-the-source)
 - [Caveats & Limitations](#caveats--limitations)
 - [CLI](#cli)
 - [Goals](#goals)
@@ -211,7 +215,51 @@ Check with `errors.Is`:
 
 ## How DorraDB works
 
-Think of three layers: the public API, the log, and the tree.
+Think of three layers: the public API, the write-ahead log, and the **clustered B+ tree** that holds every key.
+
+### Clustered B+ tree
+
+All user data lives in one B+ tree rooted at `TableRoot` in the meta page (`internal/btree`). “Clustered” means the leaf pages *are* the table: each leaf cell stores the user key and its value(s), not a pointer into a separate heap. Keys are compared as raw bytes (lexicographic), so prefixes like `user:…` stay near each other on disk.
+
+```text
+                    [internal]
+                   /          \
+            [internal]      [internal]
+             /    \          /    \
+         [leaf] [leaf]   [leaf] [leaf]  ← keys + MVCC versions (or overflow refs)
+            \_____/         \_____/
+           right-sibling links (leaf chain)
+```
+
+**Page layout (4 KiB):**
+
+| Kind | Role |
+| --- | --- |
+| **Internal** | Separator keys + child page ids. Search descends `root → … → leaf`. |
+| **Leaf** | Sorted cells. Each cell is one user key plus a **newest-first version chain**. Leaves are linked by a right-sibling pointer for ordered scans later. |
+| **Overflow** | Value bytes that do not fit inline in a leaf cell (chunked page chain). |
+
+A leaf page uses a classic slotted layout: a fixed 16-byte header (type, key count, lower/upper freelist bounds, right sibling / left child), cell payloads growing up from the header, and a slot directory growing down from the end of the page. Binary search walks the slot directory by key.
+
+**What a leaf cell holds:**
+
+```text
+key | version₀ (newest) | version₁ | … | versionₙ
+      sequence, flags (live / deleted / overflow),
+      inline bytes  —or—  overflow page id + total length
+```
+
+Reads at snapshot `S` walk the chain and take the newest version with `sequence ≤ S` that is not a delete tombstone. Writes prepend a new version (or a delete flag). After each write, versions older than the oldest pinned reader are pruned from that cell. A cell that grows past half a page of footprint (too many live versions on one hot key) fails with `ErrTooBig`.
+
+**Splits:** when a leaf (or internal) no longer fits, DorraDB splits by bytes into two pages and **promotes** the separator (smallest key on the right) up the ancestor path, creating a new root when the old root splits. Underfull leaves are **not** merged on delete today; space comes back via freelist reuse and vacuum.
+
+**Concurrency inside the tree:** one writer at a time for `Put` / `Delete` / `Prune`; readers share a read lock so they never observe a page mid-rewrite. The buffer pool does not steal dirty frames — the tree flushes only when the whole structure is consistent (before a mutation that needs free frames, or between leaves during prune).
+
+**Large values:** if the value does not fit inline with the cell’s other versions, it is written to overflow pages and the leaf keeps only `(OverflowPage, ValueLen)`.
+
+**Vacuum** walks the tree after checkpoint when approximate dead bytes exceed `VacuumDeadBytes`, drops versions no snapshot needs, and removes fully tombstoned keys.
+
+### WAL, buffer pool, and checkpoints
 
 1. **Mutations** are **group-committed** to the WAL and fsynced (unless `DisableSync`).
 2. They are then applied to **dirty B+ tree / overflow pages** in the buffer pool; `committedSequence` is published and the call returns.
@@ -220,8 +268,6 @@ Think of three layers: the public API, the log, and the tree.
 **Crash recovery on open:** replay a complete `-journal` if one exists (a torn one is discarded), load the table root from the meta page, then replay WAL records with sequence greater than the main file’s flushed sequence.
 
 **Buffer pool:** fixed size (`CachePages`). **No-steal** — dirty pages are never evicted without a flush. The meta header is only written as part of a flush. Every flush is atomic: dirty pages plus the meta page (sequence + `TableRoot`) go to the `-journal` first (fsync), then into the main file (fsync), then the journal is removed. So the main file always holds one complete tree; the WAL covers everything after it. When the cache runs low, the tree flushes between operations — `CachePages` limits memory, not write volume. The main file grows in 256 KiB chunks.
-
-**MVCC:** updates and deletes add versioned cells in leaves. On every write, versions no open reader can still see (older than the oldest pinned snapshot) are dropped from that cell. Large values spill to overflow pages. **Vacuum** (after checkpoint when `ApproxDeadBytes` exceeds `VacuumDeadBytes`) prunes the whole tree and drops tombstoned keys.
 
 ### On-disk format
 
