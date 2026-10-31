@@ -1,4 +1,5 @@
-// Package dorradb is an embedded key-value store with a WAL, 4 KiB buffer pool, and checkpoints.
+// Package dorradb is an embedded key-value store with a clustered B+ tree,
+// WAL, 4 KiB buffer pool, and checkpoints.
 //
 // DorraDB provides ACID transactions. Every read and write runs inside a
 // transaction (AUTOCOMMIT for single Get/Set/Delete/Has, or explicit

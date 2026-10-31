@@ -61,8 +61,8 @@ func TestRecoveryFromWALWhenMainLags(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Simulate crash after WAL durable but before pages persisted:
-	// reset main to meta-only with sequence 0; keep WAL intact.
+	// Simulate crash after WAL durable but before table pages persisted:
+	// reset main to empty meta (sequence 0, no table root); keep WAL intact.
 	meta := page.EncodeMetaPage(encode.Header{
 		FileType:            encode.FileTypeMain,
 		FormatVersion:       encode.FormatVersion,
@@ -70,6 +70,7 @@ func TestRecoveryFromWALWhenMainLags(t *testing.T) {
 		WalCheckpointOffset: encode.HeaderSize,
 		PageSize:            page.Size,
 		PageCount:           1,
+		TableRoot:           0,
 	})
 	if err := os.WriteFile(path, meta, 0o644); err != nil {
 		t.Fatal(err)
@@ -168,6 +169,41 @@ func TestVacuumAfterCheckpoint(t *testing.T) {
 	st := db.Stats()
 	if st.CachePages != 256 {
 		t.Fatalf("cache_pages=%d", st.CachePages)
+	}
+}
+
+func TestManyKeysReopen(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.dorradb")
+	db, err := dorradb.Open(path, dorradb.Options{DisableSync: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n = 300
+	for i := 0; i < n; i++ {
+		k := []byte{byte(i >> 8), byte(i)}
+		v := []byte{byte(i)}
+		if err := db.Set(k, v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db2, err := dorradb.Open(path, dorradb.Options{DisableSync: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	for i := 0; i < n; i++ {
+		k := []byte{byte(i >> 8), byte(i)}
+		got, err := db2.Get(k)
+		if err != nil {
+			t.Fatalf("i=%d: %v", i, err)
+		}
+		if len(got) != 1 || got[0] != byte(i) {
+			t.Fatalf("i=%d got %v", i, got)
+		}
 	}
 }
 

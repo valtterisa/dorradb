@@ -1,10 +1,15 @@
-// Package storage owns the main *.dorradb file via a buffer pool
-// and heap access methods on top of it.
+// Package storage owns the main *.dorradb file via a buffer pool.
 //
 // BufferPool keeps a fixed slice of frames and an in-memory page directory
 // (pageToFrame) mapping pageID → frame index for cached pages only. On-disk
 // address is implicit: offset = pageID * 4096. There is no separate on-disk
 // page catalog.
+//
+// The pool is no-steal: dirty pages are never evicted. They reach the main
+// file only through FlushAll, which first writes every dirty page (and the
+// meta page) to path+"-journal", fsyncs it, then writes the main file. On open
+// a complete journal is replayed, so the main file always holds the state of
+// one whole FlushAll, never a mix.
 package storage
 
 import (
@@ -12,6 +17,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"dorradb/internal/encode"
 	"dorradb/internal/storage/page"
@@ -22,11 +28,13 @@ const (
 	defaultCachePages = 256
 	minCachePages     = 2
 	defaultGrowPages  = 64 // 256 KiB chunks
+
+	journalMagic uint32 = 0x4C4E524A // "JRNL"
 )
 
 var (
 	ErrClosed      = errors.New("storage: closed")
-	ErrNoFreeFrame = errors.New("storage: no free buffer frame (all pinned)")
+	ErrNoFreeFrame = errors.New("storage: no free buffer frame (all pinned or dirty)")
 	ErrBadPageID   = errors.New("storage: bad page id")
 	ErrBadCache    = errors.New("storage: CachePages must be >= 2")
 )
@@ -42,7 +50,9 @@ type OpenOptions struct {
 
 // BufferPool is the sole main-file I/O path: fixed 4 KiB pages, clock eviction.
 // frames is the buffer pool; pageToFrame is the buffer directory (cached pages only).
+// All methods are safe for concurrent use; callers serialize page contents themselves.
 type BufferPool struct {
+	mu   sync.Mutex
 	fs   vfs.FS
 	path string
 	f    vfs.File
@@ -65,6 +75,8 @@ type frame struct {
 	ref    bool
 	used   bool
 }
+
+func JournalPath(dbPath string) string { return dbPath + "-journal" }
 
 // Open creates or opens the main DB as a paged file.
 func Open(fs vfs.FS, dbPath string, create bool, opts OpenOptions) (*BufferPool, error) {
@@ -98,6 +110,10 @@ func Open(fs vfs.FS, dbPath string, create bool, opts OpenOptions) (*BufferPool,
 	}
 	f, err := fs.OpenFile(dbPath, flag, 0o644)
 	if err != nil {
+		return nil, err
+	}
+	if err := recoverJournal(fs, dbPath, f); err != nil {
+		_ = f.Close()
 		return nil, err
 	}
 	info, err := f.Stat()
@@ -165,17 +181,114 @@ func Open(fs vfs.FS, dbPath string, create bool, opts OpenOptions) (*BufferPool,
 	return p, nil
 }
 
-func (p *BufferPool) Path() string          { return p.path }
-func (p *BufferPool) Header() encode.Header { return p.hdr }
-func (p *BufferPool) PageCount() uint32     { return p.hdr.PageCount }
-func (p *BufferPool) FilePages() uint32     { return p.filePages }
-func (p *BufferPool) CachePages() int       { return len(p.frames) }
+// recoverJournal replays a complete journal into the main file, then removes it.
+// A torn or corrupt journal is discarded: main was not touched before the
+// journal was fsynced, so it still holds the previous flush.
+func recoverJournal(fs vfs.FS, dbPath string, main vfs.File) error {
+	jpath := JournalPath(dbPath)
+	jf, err := fs.OpenFile(jpath, os.O_RDONLY, 0)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	info, err := jf.Stat()
+	if err != nil {
+		_ = jf.Close()
+		return err
+	}
+	buf := make([]byte, info.Size())
+	_, err = jf.ReadAt(buf, 0)
+	_ = jf.Close()
+	if err != nil && info.Size() > 0 {
+		return err
+	}
+	entries, ok := decodeJournal(buf)
+	if ok {
+		for _, e := range entries {
+			if _, err := main.WriteAt(e.data, int64(e.pageID)*page.Size); err != nil {
+				return err
+			}
+		}
+		if err := main.Sync(); err != nil {
+			return err
+		}
+	}
+	if err := fs.Remove(jpath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+type journalEntry struct {
+	pageID uint32
+	data   []byte
+}
+
+// Journal layout: magic u32 | count u32 | (pageID u32 | page bytes)* | crc32.
+func encodeJournal(entries []journalEntry) []byte {
+	buf := make([]byte, 0, 8+len(entries)*(4+page.Size)+4)
+	buf = encode.AppendU32(buf, journalMagic)
+	buf = encode.AppendU32(buf, uint32(len(entries)))
+	for _, e := range entries {
+		buf = encode.AppendU32(buf, e.pageID)
+		buf = append(buf, e.data...)
+	}
+	return encode.AppendU32(buf, encode.CRC(buf))
+}
+
+func decodeJournal(buf []byte) ([]journalEntry, bool) {
+	if len(buf) < 12 || binary.LittleEndian.Uint32(buf[0:4]) != journalMagic {
+		return nil, false
+	}
+	n := int(binary.LittleEndian.Uint32(buf[4:8]))
+	want := 8 + n*(4+page.Size) + 4
+	if n < 0 || len(buf) != want {
+		return nil, false
+	}
+	body := buf[:len(buf)-4]
+	if encode.CRC(body) != binary.LittleEndian.Uint32(buf[len(buf)-4:]) {
+		return nil, false
+	}
+	entries := make([]journalEntry, n)
+	off := 8
+	for i := range entries {
+		entries[i].pageID = binary.LittleEndian.Uint32(buf[off:])
+		off += 4
+		entries[i].data = buf[off : off+page.Size]
+		off += page.Size
+	}
+	return entries, true
+}
+
+func (p *BufferPool) Path() string { return p.path }
+
+func (p *BufferPool) Header() encode.Header {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.hdr
+}
+
+func (p *BufferPool) PageCount() uint32 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.hdr.PageCount
+}
+
+func (p *BufferPool) CachePages() int { return len(p.frames) }
 
 // Size is the allocated file extent in bytes (may exceed logical PageCount).
-func (p *BufferPool) Size() int64 { return int64(p.filePages) * page.Size }
+func (p *BufferPool) Size() int64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return int64(p.filePages) * page.Size
+}
 
 // DirtyFrames counts dirty frames currently in the pool.
 func (p *BufferPool) DirtyFrames() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	n := 0
 	for i := range p.frames {
 		if p.frames[i].used && p.frames[i].dirty {
@@ -185,8 +298,28 @@ func (p *BufferPool) DirtyFrames() int {
 	return n
 }
 
-// SetHeader updates in-memory meta and writes page 0 (no fsync).
+// FreeFrames counts frames that can be (re)used without a flush:
+// empty, or holding a clean unpinned page.
+func (p *BufferPool) FreeFrames() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := 0
+	for i := range p.frames {
+		fr := &p.frames[i]
+		if !fr.used || (!fr.dirty && fr.pin == 0) {
+			n++
+		}
+	}
+	return n
+}
+
+// SetHeader updates in-memory meta. It reaches disk on the next FlushAll.
 func (p *BufferPool) SetHeader(h encode.Header) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.f == nil {
+		return ErrClosed
+	}
 	h.FileType = encode.FileTypeMain
 	h.FormatVersion = encode.FormatVersion
 	if h.PageSize == 0 {
@@ -194,20 +327,18 @@ func (p *BufferPool) SetHeader(h encode.Header) error {
 	}
 	p.hdr = h
 	p.metaDirty = true
-	return p.writeMeta()
-}
-
-func (p *BufferPool) writeMeta() error {
-	_, err := p.f.WriteAt(page.EncodeMetaPage(p.hdr), 0)
-	if err == nil {
-		p.metaDirty = false
-	}
-	return err
+	return nil
 }
 
 // Get pins pageID in the buffer pool (loads from disk if needed).
 // Page 0 is meta-only — use Header / SetHeader.
 func (p *BufferPool) Get(pageID uint32) ([]byte, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.get(pageID)
+}
+
+func (p *BufferPool) get(pageID uint32) ([]byte, error) {
 	if p.f == nil {
 		return nil, ErrClosed
 	}
@@ -237,42 +368,37 @@ func (p *BufferPool) Get(pageID uint32) ([]byte, error) {
 	return fr.data, nil
 }
 
-// NewPage allocates a page (freelist or extend), runs initFn, and returns it pinned.
-// Meta is marked dirty but not written until FlushAll / SetHeader (amortized growth).
+// NewPage allocates a page (freelist or extend), runs initFn, and returns it pinned and dirty.
 func (p *BufferPool) NewPage(initFn func([]byte)) (uint32, []byte, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if p.f == nil {
 		return 0, nil, ErrClosed
 	}
 	if p.hdr.FreelistHead != 0 {
 		id := p.hdr.FreelistHead
-		buf, err := p.Get(id)
+		buf, err := p.get(id)
 		if err != nil {
 			return 0, nil, err
 		}
 		p.hdr.FreelistHead = binary.LittleEndian.Uint32(buf[page.FreeNext:])
+		p.metaDirty = true
 		clear(buf)
 		initFn(buf)
-		p.MarkDirty(id)
-		// Persist freelist head without fsync (checkpoint/FlushAll syncs).
-		if err := p.writeMeta(); err != nil {
-			p.Unpin(id, false)
-			return 0, nil, err
-		}
+		p.frames[p.pageToFrame[id]].dirty = true
 		return id, buf, nil
 	}
 
 	if err := p.ensureCapacity(); err != nil {
 		return 0, nil, err
 	}
-
-	id := p.hdr.PageCount
-	p.hdr.PageCount++
-
 	fi, err := p.evict()
 	if err != nil {
-		p.hdr.PageCount--
 		return 0, nil, err
 	}
+	id := p.hdr.PageCount
+	p.hdr.PageCount++
+	p.metaDirty = true
 	fr := &p.frames[fi]
 	clear(fr.data)
 	initFn(fr.data)
@@ -282,13 +408,6 @@ func (p *BufferPool) NewPage(initFn func([]byte)) (uint32, []byte, error) {
 	fr.ref = true
 	fr.used = true
 	p.pageToFrame[id] = fi
-	// Persist PageCount without fsync; file extent already reserved by Truncate.
-	if err := p.writeMeta(); err != nil {
-		delete(p.pageToFrame, id)
-		fr.used = false
-		p.hdr.PageCount--
-		return 0, nil, err
-	}
 	return id, fr.data, nil
 }
 
@@ -312,16 +431,10 @@ func (p *BufferPool) ensureCapacity() error {
 	return nil
 }
 
-// MarkDirty marks a cached page dirty.
-func (p *BufferPool) MarkDirty(pageID uint32) {
-	if fi, ok := p.pageToFrame[pageID]; ok {
-		p.frames[fi].dirty = true
-		p.frames[fi].ref = true
-	}
-}
-
 // Unpin releases a pin; dirty marks the page dirty before release.
 func (p *BufferPool) Unpin(pageID uint32, dirty bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	fi, ok := p.pageToFrame[pageID]
 	if !ok {
 		return
@@ -335,6 +448,7 @@ func (p *BufferPool) Unpin(pageID uint32, dirty bool) {
 	}
 }
 
+// evict returns a free frame. Dirty frames are never evicted (no-steal).
 func (p *BufferPool) evict() (int, error) {
 	n := len(p.frames)
 	for passes := 0; passes < 2*n; passes++ {
@@ -344,82 +458,116 @@ func (p *BufferPool) evict() (int, error) {
 		if !fr.used {
 			return i, nil
 		}
-		if fr.pin > 0 {
+		if fr.pin > 0 || fr.dirty {
 			continue
 		}
 		if fr.ref {
 			fr.ref = false
 			continue
 		}
-		if fr.dirty {
-			if err := p.writeFrame(fr); err != nil {
-				return 0, err
-			}
-		}
 		delete(p.pageToFrame, fr.pageID)
 		fr.used = false
-		fr.dirty = false
 		fr.pageID = 0
 		return i, nil
 	}
 	return 0, ErrNoFreeFrame
 }
 
-func (p *BufferPool) writeFrame(fr *frame) error {
-	if _, err := p.f.WriteAt(fr.data, int64(fr.pageID)*page.Size); err != nil {
-		return err
-	}
-	fr.dirty = false
-	return nil
-}
-
-// Flush writes one dirty cached page (not required for commit durability).
-func (p *BufferPool) Flush(pageID uint32) error {
-	fi, ok := p.pageToFrame[pageID]
-	if !ok || !p.frames[fi].dirty {
-		return nil
-	}
-	return p.writeFrame(&p.frames[fi])
-}
-
-// FlushAll writes dirty pages, meta, and fsyncs the file.
+// FlushAll atomically writes all dirty pages and meta (via the journal) and fsyncs.
 func (p *BufferPool) FlushAll() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.flushAll()
+}
+
+func (p *BufferPool) flushAll() error {
+	if p.f == nil {
+		return ErrClosed
+	}
+	var entries []journalEntry
+	var dirty []*frame
 	for i := range p.frames {
 		fr := &p.frames[i]
 		if fr.used && fr.dirty {
-			if err := p.writeFrame(fr); err != nil {
-				return err
-			}
+			entries = append(entries, journalEntry{pageID: fr.pageID, data: fr.data})
+			dirty = append(dirty, fr)
 		}
 	}
-	if err := p.writeMeta(); err != nil {
+	if p.metaDirty {
+		entries = append(entries, journalEntry{pageID: 0, data: page.EncodeMetaPage(p.hdr)})
+	}
+	if len(entries) == 0 {
+		return p.f.Sync()
+	}
+
+	jpath := JournalPath(p.path)
+	jf, err := p.fs.OpenFile(jpath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
 		return err
 	}
-	return p.f.Sync()
+	if _, err := jf.WriteAt(encodeJournal(entries), 0); err != nil {
+		_ = jf.Close()
+		return err
+	}
+	if err := jf.Sync(); err != nil {
+		_ = jf.Close()
+		return err
+	}
+	if err := jf.Close(); err != nil {
+		return err
+	}
+	_ = p.fs.SyncDir(jpath)
+
+	for _, e := range entries {
+		if _, err := p.f.WriteAt(e.data, int64(e.pageID)*page.Size); err != nil {
+			return err
+		}
+	}
+	if err := p.f.Sync(); err != nil {
+		return err
+	}
+	for _, fr := range dirty {
+		fr.dirty = false
+	}
+	p.metaDirty = false
+	if err := p.fs.Remove(jpath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 // FreePage pushes pageID onto the freelist (must not be pinned by the caller).
 func (p *BufferPool) FreePage(pageID uint32) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if pageID == 0 || pageID >= p.hdr.PageCount {
 		return ErrBadPageID
 	}
-	buf, err := p.Get(pageID)
+	buf, err := p.get(pageID)
 	if err != nil {
 		return err
 	}
 	clear(buf)
 	binary.LittleEndian.PutUint32(buf[page.FreeNext:], p.hdr.FreelistHead)
 	p.hdr.FreelistHead = pageID
-	p.Unpin(pageID, true)
-	return p.writeMeta()
+	p.metaDirty = true
+	fr := &p.frames[p.pageToFrame[pageID]]
+	fr.dirty = true
+	fr.pin--
+	return nil
 }
 
 func (p *BufferPool) Close() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if p.f == nil {
 		return nil
 	}
-	_ = p.FlushAll()
+	ferr := p.flushAll()
 	err := p.f.Close()
 	p.f = nil
+	if ferr != nil {
+		return ferr
+	}
 	return err
 }
