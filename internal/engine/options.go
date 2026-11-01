@@ -31,7 +31,7 @@ func DefaultOptions() Options {
 		WALCheckpointBytes:    8 << 20,
 		WALCheckpointInterval: 30 * time.Second,
 		SyncWAL:               true,
-		CachePages:            256,
+		CachePages:            512,
 		VacuumDeadBytes:       8 << 20,
 	}
 }
