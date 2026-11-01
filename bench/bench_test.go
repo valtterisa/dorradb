@@ -26,7 +26,7 @@ const (
 	valSmall   = 64
 	valLarge   = 1024
 	batchSize  = 100
-	fillN      = 10_000
+	fillN = 100_000 // ~2.4k leaves; exceeds default 512-page (~2 MiB) pool
 )
 
 func keyOf(i int) []byte {

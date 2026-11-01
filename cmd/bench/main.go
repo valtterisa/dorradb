@@ -26,9 +26,9 @@ const (
 	keyLen   = 16
 	valLen   = 64
 	batchN   = 100
-	fillN    = 10_000
+	fillN    = 100_000 // ~2.4k leaves; exceeds default 512-page (~2 MiB) pool
 	batches  = 80
-	getIters = 40_000
+	getIters = 80_000
 )
 
 func main() {
@@ -80,7 +80,7 @@ func printHelp() {
 
   go run ./cmd/bench           all (writes + reads)
   go run ./cmd/bench writes    batched puts (durable + nosync)
-  go run ./cmd/bench reads     fill 10k then random gets
+  go run ./cmd/bench reads     fill 100k then random gets
   go run ./cmd/bench help
 
 `)
