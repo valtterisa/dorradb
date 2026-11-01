@@ -298,13 +298,15 @@ Useful entry points if you want to see how the pieces connect:
 
 ## Benchmarks
 
+**1:1** vs **SQLite WAL** (`modernc.org/sqlite`, pure Go): matched `cache_size` ≈ `CachePages×4KiB`, `mmap_size=0`, sync aligned. No handicap budget — who is faster wins.
+
 ```bash
-go run ./cmd/bench           # writes + reads vs bbolt
+go run ./cmd/bench           # writes + reads
 go run ./cmd/bench writes
 go run ./cmd/bench reads
 ```
 
-Raw Go benches: [`bench/`](bench/).
+Details: [`bench/`](bench/).
 
 ## CLI
 

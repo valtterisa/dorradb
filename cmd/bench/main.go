@@ -1,12 +1,16 @@
-// Command bench: quick DorraDB vs bbolt timing in the terminal.
+// Command bench: DorraDB vs SQLite WAL 1:1 (matched cache + sync).
 //
-//	go run ./cmd/bench           # everything
-//	go run ./cmd/bench reads     # random gets
-//	go run ./cmd/bench writes    # batched puts (sync + nosync)
+//	go run ./cmd/bench           # writes + reads
+//	go run ./cmd/bench writes
+//	go run ./cmd/bench reads
 //	go run ./cmd/bench help
+//
+// Peer: modernc.org/sqlite (pure Go), journal_mode=WAL, mmap_size=0,
+// cache_size ≈ CachePages×4KiB. Straight timing — no “budget” / pass-fail.
 package main
 
 import (
+	"database/sql"
 	"encoding/binary"
 	"fmt"
 	"math/rand"
@@ -18,17 +22,20 @@ import (
 
 	"dorradb"
 
-	bolt "go.etcd.io/bbolt"
+	_ "modernc.org/sqlite"
 )
 
 const (
-	bucket   = "kv"
-	keyLen   = 16
-	valLen   = 64
-	batchN   = 100
-	fillN    = 100_000 // ~2.4k leaves; exceeds default 512-page (~2 MiB) pool
-	batches  = 80
-	getIters = 80_000
+	keyLen     = 16
+	valLen     = 64
+	batchN     = 100
+	batches    = 80
+	fillN      = 100_000
+	hotN       = 8_000
+	getIters   = 50_000
+	cachePages = 512
+	// SQLite negative cache_size is KiB. 512×4 KiB = 2048 KiB.
+	sqliteCacheKiB = cachePages * 4
 )
 
 func main() {
@@ -58,8 +65,9 @@ func run(args []string) int {
 	}
 
 	fmt.Printf("\n  dorradb bench  ·  %s/%s\n", runtime.GOOS, runtime.GOARCH)
-	fmt.Printf("  vs bbolt  ·  lower time wins\n")
-	fmt.Printf("  %s\n\n", strings.Repeat("─", 40))
+	fmt.Printf("  peer: sqlite WAL (modernc)  ·  1:1  ·  lower time wins\n")
+	fmt.Printf("  cache: %d pages / %d KiB  ·  fill %d  ·  hot %d  ·  mmap_size=0\n\n",
+		cachePages, sqliteCacheKiB, fillN, hotN)
 
 	switch cmd {
 	case "all":
@@ -76,32 +84,44 @@ func run(args []string) int {
 }
 
 func printHelp() {
-	fmt.Fprintf(os.Stderr, `dorradb bench — tiny local speed check vs bbolt
+	fmt.Fprintf(os.Stderr, `dorradb bench — 1:1 DorraDB vs SQLite WAL (matched cache/sync)
 
-  go run ./cmd/bench           all (writes + reads)
-  go run ./cmd/bench writes    batched puts (durable + nosync)
-  go run ./cmd/bench reads     fill 100k then random gets
+  go run ./cmd/bench           writes + reads
+  go run ./cmd/bench writes    durable + nosync batches
+  go run ./cmd/bench reads     hot-set + cold uniform Gets
   go run ./cmd/bench help
 
-`)
+Both Go. SQLite: journal_mode=WAL, cache_size=-%d KiB, mmap_size=0,
+synchronous=FULL|OFF. No pass/fail budget — who is faster wins.
+
+`, sqliteCacheKiB)
 }
 
 func runWrites() {
-	section("writes · durable", fmt.Sprintf("%d puts / commit, fsync on", batchN))
+	section("writes · durable", fmt.Sprintf("%d puts / commit, fsync/FULL", batchN))
 	a := must(timePutBatch("dorradb", false))
-	b := must(timePutBatch("bbolt", false))
+	b := must(timePutBatch("sqlite", false))
 	printPair(a, b, "batch")
 
-	section("writes · nosync", fmt.Sprintf("%d puts / commit, fsync off", batchN))
+	section("writes · nosync", fmt.Sprintf("%d puts / commit, fsync off / OFF", batchN))
 	a = must(timePutBatch("dorradb", true))
-	b = must(timePutBatch("bbolt", true))
+	b = must(timePutBatch("sqlite", true))
 	printPair(a, b, "batch")
 }
 
 func runReads() {
-	section("reads · random", fmt.Sprintf("fill %d, then %d gets", fillN, getIters))
-	a := must(timeGetRand("dorradb"))
-	b := must(timeGetRand("bbolt"))
+	section("reads · hot",
+		fmt.Sprintf("fill %d nosync, %d gets over last %d keys, one read tx",
+			fillN, getIters, hotN))
+	a := must(timeGetHot("dorradb"))
+	b := must(timeGetHot("sqlite"))
+	printPair(a, b, "get")
+
+	section("reads · cold",
+		fmt.Sprintf("same fill, %d uniform gets (DB ≫ %d KiB cache)",
+			getIters, sqliteCacheKiB))
+	a = must(timeGetCold("dorradb"))
+	b = must(timeGetCold("sqlite"))
 	printPair(a, b, "get")
 }
 
@@ -148,7 +168,10 @@ func timePutBatch(engine string, nosync bool) (result, error) {
 
 	switch engine {
 	case "dorradb":
-		db, err := dorradb.Open(filepath.Join(dir, "db"), dorradb.Options{DisableSync: nosync})
+		db, err := dorradb.Open(filepath.Join(dir, "db"), dorradb.Options{
+			DisableSync: nosync,
+			CachePages:  cachePages,
+		})
 		if err != nil {
 			return result{}, err
 		}
@@ -169,30 +192,32 @@ func timePutBatch(engine string, nosync bool) (result, error) {
 				return result{}, err
 			}
 		}
-	case "bbolt":
-		db, err := bolt.Open(filepath.Join(dir, "db"), 0o600, &bolt.Options{NoSync: nosync})
+	case "sqlite":
+		db, err := openSQLite(filepath.Join(dir, "db.sqlite"), nosync)
 		if err != nil {
 			return result{}, err
 		}
 		defer db.Close()
-		if err := db.Update(func(tx *bolt.Tx) error {
-			_, err := tx.CreateBucketIfNotExists([]byte(bucket))
-			return err
-		}); err != nil {
-			return result{}, err
-		}
 		for i := 0; i < batches; i++ {
 			base := i * batchN
-			err := db.Update(func(tx *bolt.Tx) error {
-				bk := tx.Bucket([]byte(bucket))
-				for j := 0; j < batchN; j++ {
-					if err := bk.Put(keyOf(base+j), v); err != nil {
-						return err
-					}
-				}
-				return nil
-			})
+			tx, err := db.Begin()
 			if err != nil {
+				return result{}, err
+			}
+			stmt, err := tx.Prepare(`INSERT OR REPLACE INTO kv(k, v) VALUES(?, ?)`)
+			if err != nil {
+				_ = tx.Rollback()
+				return result{}, err
+			}
+			for j := 0; j < batchN; j++ {
+				if _, err := stmt.Exec(keyOf(base+j), v); err != nil {
+					_ = stmt.Close()
+					_ = tx.Rollback()
+					return result{}, err
+				}
+			}
+			_ = stmt.Close()
+			if err := tx.Commit(); err != nil {
 				return result{}, err
 			}
 		}
@@ -201,7 +226,18 @@ func timePutBatch(engine string, nosync bool) (result, error) {
 	return result{engine, elapsed / time.Duration(batches)}, nil
 }
 
-func timeGetRand(engine string) (result, error) {
+func timeGetHot(engine string) (result, error) {
+	return timeGetRange(engine, fillN-hotN, fillN)
+}
+
+func timeGetCold(engine string) (result, error) {
+	return timeGetRange(engine, 0, fillN)
+}
+
+func timeGetRange(engine string, lo, hi int) (result, error) {
+	if hi <= lo {
+		return result{}, fmt.Errorf("empty get range")
+	}
 	dir, err := os.MkdirTemp("", "bench-*")
 	if err != nil {
 		return result{}, err
@@ -209,63 +245,149 @@ func timeGetRand(engine string) (result, error) {
 	defer os.RemoveAll(dir)
 	v := valOf(0)
 	rng := rand.New(rand.NewSource(1))
+	span := hi - lo
 	var elapsed time.Duration
 
 	switch engine {
 	case "dorradb":
-		db, err := dorradb.Open(filepath.Join(dir, "db"))
+		db, err := dorradb.Open(filepath.Join(dir, "db"), dorradb.Options{
+			DisableSync: true,
+			CachePages:  cachePages,
+		})
 		if err != nil {
 			return result{}, err
 		}
 		defer db.Close()
-		for i := 0; i < fillN; i++ {
-			if err := db.Set(keyOf(i), v); err != nil {
-				return result{}, err
-			}
+		if err := fillDorra(db, v); err != nil {
+			return result{}, err
+		}
+		tx, err := db.Begin(false)
+		if err != nil {
+			return result{}, err
 		}
 		start := time.Now()
 		for i := 0; i < getIters; i++ {
-			if _, err := db.Get(keyOf(rng.Intn(fillN))); err != nil {
+			if _, err := tx.Get(keyOf(lo + rng.Intn(span))); err != nil {
+				_ = tx.Rollback()
 				return result{}, err
 			}
 		}
 		elapsed = time.Since(start)
-	case "bbolt":
-		db, err := bolt.Open(filepath.Join(dir, "db"), 0o600, nil)
+		_ = tx.Rollback()
+	case "sqlite":
+		db, err := openSQLite(filepath.Join(dir, "db.sqlite"), true)
 		if err != nil {
 			return result{}, err
 		}
 		defer db.Close()
-		if err := db.Update(func(tx *bolt.Tx) error {
-			bk, err := tx.CreateBucketIfNotExists([]byte(bucket))
-			if err != nil {
-				return err
-			}
-			for i := 0; i < fillN; i++ {
-				if err := bk.Put(keyOf(i), v); err != nil {
-					return err
-				}
-			}
-			return nil
-		}); err != nil {
+		if err := fillSQLite(db, v); err != nil {
+			return result{}, err
+		}
+		tx, err := db.Begin()
+		if err != nil {
+			return result{}, err
+		}
+		stmt, err := tx.Prepare(`SELECT v FROM kv WHERE k = ?`)
+		if err != nil {
+			_ = tx.Rollback()
 			return result{}, err
 		}
 		start := time.Now()
 		for i := 0; i < getIters; i++ {
-			k := keyOf(rng.Intn(fillN))
-			err := db.View(func(tx *bolt.Tx) error {
-				if tx.Bucket([]byte(bucket)).Get(k) == nil {
-					return fmt.Errorf("missing")
-				}
-				return nil
-			})
-			if err != nil {
+			var got []byte
+			if err := stmt.QueryRow(keyOf(lo + rng.Intn(span))).Scan(&got); err != nil {
+				_ = stmt.Close()
+				_ = tx.Rollback()
 				return result{}, err
 			}
 		}
 		elapsed = time.Since(start)
+		_ = stmt.Close()
+		_ = tx.Rollback()
 	}
 	return result{engine, elapsed / time.Duration(getIters)}, nil
+}
+
+func openSQLite(path string, nosync bool) (*sql.DB, error) {
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	sync := "FULL"
+	if nosync {
+		sync = "OFF"
+	}
+	pragmas := []string{
+		`PRAGMA journal_mode=WAL`,
+		`PRAGMA synchronous=` + sync,
+		fmt.Sprintf(`PRAGMA cache_size=%d`, -sqliteCacheKiB),
+		`PRAGMA mmap_size=0`,
+		`PRAGMA temp_store=MEMORY`,
+		`CREATE TABLE IF NOT EXISTS kv (k BLOB PRIMARY KEY, v BLOB NOT NULL)`,
+	}
+	for _, p := range pragmas {
+		if _, err := db.Exec(p); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("%s: %w", p, err)
+		}
+	}
+	return db, nil
+}
+
+func fillDorra(db *dorradb.DB, v []byte) error {
+	const chunk = 500
+	for i := 0; i < fillN; i += chunk {
+		tx, err := db.Begin(true)
+		if err != nil {
+			return err
+		}
+		end := i + chunk
+		if end > fillN {
+			end = fillN
+		}
+		for j := i; j < end; j++ {
+			if err := tx.Set(keyOf(j), v); err != nil {
+				_ = tx.Rollback()
+				return err
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func fillSQLite(db *sql.DB, v []byte) error {
+	const chunk = 500
+	for i := 0; i < fillN; i += chunk {
+		tx, err := db.Begin()
+		if err != nil {
+			return err
+		}
+		stmt, err := tx.Prepare(`INSERT OR REPLACE INTO kv(k, v) VALUES(?, ?)`)
+		if err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		end := i + chunk
+		if end > fillN {
+			end = fillN
+		}
+		for j := i; j < end; j++ {
+			if _, err := stmt.Exec(keyOf(j), v); err != nil {
+				_ = stmt.Close()
+				_ = tx.Rollback()
+				return err
+			}
+		}
+		_ = stmt.Close()
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func fmtDur(d time.Duration) string {
