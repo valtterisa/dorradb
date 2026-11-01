@@ -1,7 +1,6 @@
 // Package bench compares DorraDB to SQLite WAL under matched cache/sync.
 //
 //	go test ./bench -bench=. -benchmem -count=3
-//	go test ./bench -bench=GetHot|PutBatch -benchmem
 //
 // Numbers are machine-specific. Peer: modernc.org/sqlite (WAL, mmap_size=0).
 package bench_test
@@ -55,6 +54,9 @@ func openDorra(t testing.TB, nosync bool) *dorradb.DB {
 	}
 	db, err := dorradb.Open(path, opts)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS kv (k BLOB PRIMARY KEY, v BLOB NOT NULL)`); err != nil {
 		t.Fatal(err)
 	}
 	return db
@@ -113,7 +115,7 @@ func fillDorra(b *testing.B, db *dorradb.DB, n int) {
 			end = n
 		}
 		for j := i; j < end; j++ {
-			if err := tx.Set(keyOf(j), v); err != nil {
+			if _, err := tx.Exec(`INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)`, keyOf(j), v); err != nil {
 				_ = tx.Rollback()
 				b.Fatal(err)
 			}
@@ -156,6 +158,19 @@ func fillSQLite(b *testing.B, db *sql.DB, n int) {
 	}
 }
 
+func queryDorra(tx *dorradb.Tx, k []byte) error {
+	rows, err := tx.Query(`SELECT v FROM kv WHERE k = ?`, k)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return dorradb.ErrNotFound
+	}
+	var got []byte
+	return rows.Scan(&got)
+}
+
 func BenchmarkPutSeq(b *testing.B) {
 	for _, nosync := range []bool{false, true} {
 		syncLabel := "sync"
@@ -167,12 +182,16 @@ func BenchmarkPutSeq(b *testing.B) {
 			b.Run("dorradb/"+name, func(b *testing.B) {
 				db := openDorra(b, nosync)
 				defer db.Close()
+				stmt, err := db.Prepare(`INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)`)
+				if err != nil {
+					b.Fatal(err)
+				}
 				v := valOf(vlen, 0)
 				b.SetBytes(int64(keyBytes + vlen))
 				b.ReportAllocs()
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
-					if err := db.Set(keyOf(i), v); err != nil {
+					if _, err := stmt.Exec(keyOf(i), v); err != nil {
 						b.Fatal(err)
 					}
 				}
@@ -220,7 +239,7 @@ func BenchmarkPutBatch(b *testing.B) {
 				}
 				base := i * batchSize
 				for j := 0; j < batchSize; j++ {
-					if err := tx.Set(keyOf(base+j), v); err != nil {
+					if _, err := tx.Exec(`INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)`, keyOf(base+j), v); err != nil {
 						_ = tx.Rollback()
 						b.Fatal(err)
 					}
@@ -281,7 +300,7 @@ func BenchmarkGetHot(b *testing.B) {
 		b.ReportAllocs()
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
-			if _, err := tx.Get(keyOf(lo + rng.Intn(hotN))); err != nil {
+			if err := queryDorra(tx, keyOf(lo+rng.Intn(hotN))); err != nil {
 				b.Fatal(err)
 			}
 		}
@@ -329,7 +348,7 @@ func BenchmarkGetCold(b *testing.B) {
 		b.ReportAllocs()
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
-			if _, err := tx.Get(keyOf(rng.Intn(fillN))); err != nil {
+			if err := queryDorra(tx, keyOf(rng.Intn(fillN))); err != nil {
 				b.Fatal(err)
 			}
 		}
@@ -372,11 +391,15 @@ func BenchmarkOverwriteHot(b *testing.B) {
 		b.Run("dorradb/"+name, func(b *testing.B) {
 			db := openDorra(b, nosync)
 			defer db.Close()
+			stmt, err := db.Prepare(`INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)`)
+			if err != nil {
+				b.Fatal(err)
+			}
 			b.SetBytes(int64(keyBytes + valSmall))
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				if err := db.Set(k, valOf(valSmall, i)); err != nil {
+				if _, err := stmt.Exec(k, valOf(valSmall, i)); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -412,15 +435,23 @@ func BenchmarkDeleteSeq(b *testing.B) {
 			db := openDorra(b, nosync)
 			defer db.Close()
 			v := valOf(valSmall, 0)
+			ins, err := db.Prepare(`INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)`)
+			if err != nil {
+				b.Fatal(err)
+			}
+			del, err := db.Prepare(`DELETE FROM kv WHERE k = ?`)
+			if err != nil {
+				b.Fatal(err)
+			}
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				b.StopTimer()
-				if err := db.Set(keyOf(i), v); err != nil {
+				if _, err := ins.Exec(keyOf(i), v); err != nil {
 					b.Fatal(err)
 				}
 				b.StartTimer()
-				if err := db.Delete(keyOf(i)); err != nil {
+				if _, err := del.Exec(keyOf(i)); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -465,12 +496,22 @@ func BenchmarkFillReport(b *testing.B) {
 			if err != nil {
 				b.Fatal(err)
 			}
+			if _, err := db.Exec(`CREATE TABLE kv (k BLOB PRIMARY KEY, v BLOB NOT NULL)`); err != nil {
+				b.Fatal(err)
+			}
 			v := valOf(valSmall, 0)
 			b.StartTimer()
+			tx, err := db.Begin(true)
+			if err != nil {
+				b.Fatal(err)
+			}
 			for j := 0; j < fillN; j++ {
-				if err := db.Set(keyOf(j), v); err != nil {
+				if _, err := tx.Exec(`INSERT INTO kv (k, v) VALUES (?, ?)`, keyOf(j), v); err != nil {
 					b.Fatal(err)
 				}
+			}
+			if err := tx.Commit(); err != nil {
+				b.Fatal(err)
 			}
 			if err := db.Close(); err != nil {
 				b.Fatal(err)

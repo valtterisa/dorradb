@@ -15,16 +15,22 @@ import (
 // (via the flusher) only at points where the whole structure is consistent:
 // before a mutation touches tree pages, or between leaves during Prune.
 type Tree struct {
-	mu    sync.RWMutex
-	pool  *storage.BufferPool
-	root  uint32
-	flush func() error
+	mu     sync.RWMutex
+	pool   *storage.BufferPool
+	root   uint32
+	flush  func() error
+	onRoot func(uint32) error // optional; when set, used instead of header TableRoot
 }
 
 // Open loads or creates the table root from the pool header.
 func Open(pool *storage.BufferPool) (*Tree, error) {
 	t := &Tree{pool: pool, root: pool.Header().TableRoot}
 	t.flush = pool.FlushAll
+	t.onRoot = func(root uint32) error {
+		h := t.pool.Header()
+		h.TableRoot = root
+		return t.pool.SetHeader(h)
+	}
 	if t.root == 0 {
 		id, _, err := pool.NewPage(func(b []byte) { Init(b, page.TypeBTreeLeaf) })
 		if err != nil {
@@ -39,6 +45,26 @@ func Open(pool *storage.BufferPool) (*Tree, error) {
 	return t, nil
 }
 
+// Attach opens an existing tree at root. onRoot is called whenever the root
+// page id changes (e.g. split); it may be nil if the caller tracks roots itself.
+func Attach(pool *storage.BufferPool, root uint32, onRoot func(uint32) error) *Tree {
+	t := &Tree{pool: pool, root: root, onRoot: onRoot}
+	t.flush = pool.FlushAll
+	return t
+}
+
+// NewEmpty creates a brand-new empty leaf root and returns its tree.
+// onRoot is stored for later root changes (splits); it is not invoked for the
+// initial root (caller records that itself).
+func NewEmpty(pool *storage.BufferPool, onRoot func(uint32) error) (*Tree, uint32, error) {
+	id, _, err := pool.NewPage(func(b []byte) { Init(b, page.TypeBTreeLeaf) })
+	if err != nil {
+		return nil, 0, err
+	}
+	pool.Unpin(id, true)
+	return Attach(pool, id, onRoot), id, nil
+}
+
 // SetFlusher replaces the function used to flush dirty pages when the cache
 // runs low. It must persist the current root (see Root) along with the pages.
 func (t *Tree) SetFlusher(fn func() error) { t.flush = fn }
@@ -47,6 +73,9 @@ func (t *Tree) SetFlusher(fn func() error) { t.flush = fn }
 func (t *Tree) Root() uint32 { return t.root }
 
 func (t *Tree) persistRoot() error {
+	if t.onRoot != nil {
+		return t.onRoot(t.root)
+	}
 	h := t.pool.Header()
 	h.TableRoot = t.root
 	return t.pool.SetHeader(h)
@@ -550,4 +579,21 @@ func (it *Iterator) Close() {
 		it.pageID, it.buf = 0, nil
 	}
 	it.t.mu.RUnlock()
+}
+
+// VisibleValue returns the value visible at snap for the current cell.
+func (it *Iterator) VisibleValue(snap uint64) ([]byte, bool, error) {
+	c, err := it.Cell()
+	if err != nil {
+		return nil, false, err
+	}
+	v, ok := VisibleVersion(c, snap)
+	if !ok {
+		return nil, false, nil
+	}
+	if v.OverflowPage != 0 {
+		val, err := it.t.readOverflow(v.OverflowPage, int(v.ValueLen))
+		return val, err == nil, err
+	}
+	return v.Value, true, nil
 }
