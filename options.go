@@ -26,7 +26,7 @@ type Options struct {
 	// but a crash may lose recently acknowledged mutations. Default: false (sync on).
 	DisableSync bool
 
-	// CachePages is the fixed buffer-pool size (4 KiB frames). Default: 256.
+	// CachePages is the fixed buffer-pool size (4 KiB frames). Default: 512.
 	// Minimum: 2. Zero keeps the default.
 	CachePages int
 

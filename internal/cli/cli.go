@@ -4,9 +4,7 @@ package cli
 import (
 	"bufio"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"os"
 	"strings"
 
@@ -14,15 +12,14 @@ import (
 )
 
 const (
-	ExitOK       = 0
-	ExitError    = 1
-	ExitNotFound = 2 // get: key missing
+	ExitOK    = 0
+	ExitError = 1
 
 	defaultDBPath = "app.dorradb"
 )
 
 // Run parses flags/subcommand and returns a process exit code.
-// No args → opens interactive shell on ./app.dorradb (easiest path).
+// No args → opens interactive shell on ./app.dorradb.
 func Run(args []string) int {
 	var dbPath string
 	var jsonOut bool
@@ -37,8 +34,6 @@ func Run(args []string) int {
 			dbPath = strings.TrimPrefix(a, "--db=")
 		case a == "--json":
 			jsonOut = true
-		case a == "-v" || a == "--verbose":
-			// reserved
 		case a == "-h" || a == "--help" || a == "help":
 			printUsage()
 			return ExitOK
@@ -53,7 +48,6 @@ func Run(args []string) int {
 		dbPath = defaultDBPath
 	}
 
-	// Bare invocation: go run ./cmd/dorradb  →  shell
 	cmd := "shell"
 	cmdArgs := []string(nil)
 	if len(rest) > 0 {
@@ -67,7 +61,7 @@ func Run(args []string) int {
 	}
 
 	switch cmd {
-	case "set", "get", "delete", "status", "shell":
+	case "exec", "query", "status", "shell":
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q — try: go run ./cmd/dorradb\n", cmd)
 		printUsage()
@@ -82,12 +76,10 @@ func Run(args []string) int {
 	defer db.Close()
 
 	switch cmd {
-	case "set":
-		return cmdSet(db, cmdArgs)
-	case "get":
-		return cmdGet(db, cmdArgs, jsonOut)
-	case "delete":
-		return cmdDelete(db, cmdArgs)
+	case "exec":
+		return cmdExec(db, cmdArgs)
+	case "query":
+		return cmdQuery(db, cmdArgs, jsonOut)
 	case "status":
 		return cmdStatus(db, jsonOut)
 	case "shell":
@@ -97,82 +89,94 @@ func Run(args []string) int {
 }
 
 func printUsage() {
-	fmt.Fprintf(os.Stderr, `dorradb — embedded KV CLI
+	fmt.Fprintf(os.Stderr, `dorradb — embedded SQL CLI
 
-  go run ./cmd/dorradb              interactive shell (uses ./app.dorradb)
+  go run ./cmd/dorradb              interactive shell (./app.dorradb)
   go run ./cmd/dorradb --db my.db   shell on another file
 
-Inside the shell (lowercase is fine):
-  set name Ada
-  get name
-  del name
+Inside the shell:
+  exec CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL)
+  exec INSERT INTO t (id, name) VALUES (1, 'Ada')
+  query SELECT name FROM t WHERE id = 1
   stats
-  help
   quit
 
-One-shot (optional):
-  go run ./cmd/dorradb get name
-  go run ./cmd/dorradb set name Ada
+One-shot:
+  go run ./cmd/dorradb exec "INSERT INTO t (id, name) VALUES (2, 'Bob')"
+  go run ./cmd/dorradb query "SELECT * FROM t"
 `)
 }
 
-func cmdSet(db *dorradb.DB, args []string) int {
-	if len(args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: dorradb set <key> <value|->")
+func cmdExec(db *dorradb.DB, args []string) int {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "usage: dorradb exec <sql>")
 		return ExitError
 	}
-	key := args[0]
-	var val []byte
-	if args[1] == "-" {
-		b, err := io.ReadAll(os.Stdin)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
-			return ExitError
-		}
-		val = b
-	} else {
-		val = []byte(strings.Join(args[1:], " "))
-	}
-	if err := db.Set([]byte(key), val); err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		return ExitError
-	}
-	return ExitOK
-}
-
-func cmdGet(db *dorradb.DB, args []string, jsonOut bool) int {
-	if len(args) != 1 {
-		fmt.Fprintln(os.Stderr, "usage: dorradb get <key>")
-		return ExitError
-	}
-	val, err := db.Get([]byte(args[0]))
-	if errors.Is(err, dorradb.ErrNotFound) {
-		return ExitNotFound
-	}
+	sql := strings.Join(args, " ")
+	res, err := db.Exec(sql)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return ExitError
 	}
-	if jsonOut {
-		enc := json.NewEncoder(os.Stdout)
-		_ = enc.Encode(map[string]string{"value": string(val)})
-		return ExitOK
-	}
-	os.Stdout.Write(val)
-	if len(val) == 0 || val[len(val)-1] != '\n' {
-		fmt.Println()
+	n, _ := res.RowsAffected()
+	if n > 0 {
+		fmt.Printf("rows_affected=%d\n", n)
 	}
 	return ExitOK
 }
 
-func cmdDelete(db *dorradb.DB, args []string) int {
-	if len(args) != 1 {
-		fmt.Fprintln(os.Stderr, "usage: dorradb delete <key>")
+func cmdQuery(db *dorradb.DB, args []string, jsonOut bool) int {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "usage: dorradb query <sql>")
 		return ExitError
 	}
-	if err := db.Delete([]byte(args[0])); err != nil {
+	sql := strings.Join(args, " ")
+	rows, err := db.Query(sql)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return ExitError
+	}
+	defer rows.Close()
+	cols := rows.Columns()
+	if jsonOut {
+		var out []map[string]any
+		for rows.Next() {
+			dest := make([]any, len(cols))
+			ptrs := make([]any, len(cols))
+			for i := range dest {
+				ptrs[i] = &dest[i]
+			}
+			if err := rows.Scan(ptrs...); err != nil {
+				fmt.Fprintf(os.Stderr, "error: %v\n", err)
+				return ExitError
+			}
+			m := make(map[string]any, len(cols))
+			for i, c := range cols {
+				m[c] = dest[i]
+			}
+			out = append(out, m)
+		}
+		_ = json.NewEncoder(os.Stdout).Encode(out)
+		return ExitOK
+	}
+	if len(cols) > 0 {
+		fmt.Println(strings.Join(cols, "\t"))
+	}
+	for rows.Next() {
+		dest := make([]any, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range dest {
+			ptrs[i] = &dest[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			return ExitError
+		}
+		parts := make([]string, len(dest))
+		for i, v := range dest {
+			parts[i] = fmt.Sprint(v)
+		}
+		fmt.Println(strings.Join(parts, "\t"))
 	}
 	return ExitOK
 }
@@ -180,8 +184,7 @@ func cmdDelete(db *dorradb.DB, args []string) int {
 func cmdStatus(db *dorradb.DB, jsonOut bool) int {
 	s := db.Stats()
 	if jsonOut {
-		enc := json.NewEncoder(os.Stdout)
-		_ = enc.Encode(s)
+		_ = json.NewEncoder(os.Stdout).Encode(s)
 		return ExitOK
 	}
 	fmt.Printf("path=%s\n", s.Path)
@@ -201,9 +204,8 @@ func cmdShell(db *dorradb.DB, dbPath string) int {
 	in := bufio.NewScanner(os.Stdin)
 	fmt.Fprintf(os.Stderr, "Opened %s\n", dbPath)
 	fmt.Fprintln(os.Stderr, `Type help for commands. Examples:
-  set name Ada
-  get name
-  del name
+  exec CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL)
+  query SELECT * FROM t
   quit`)
 	for {
 		fmt.Fprint(os.Stderr, "dorradb> ")
@@ -220,48 +222,58 @@ func cmdShell(db *dorradb.DB, dbPath string) int {
 		case "q", "quit", "exit":
 			return ExitOK
 		case "h", "help", "?":
-			fmt.Fprintln(os.Stderr, `  set <key> <value>   save
-  get <key>           read
-  del <key>           delete
-  stats               info
+			fmt.Fprintln(os.Stderr, `  exec <sql>    run INSERT/UPDATE/DELETE/CREATE
+  query <sql>   run SELECT
+  stats         info
   quit`)
-		case "get":
+		case "exec":
 			if len(parts) < 2 {
-				fmt.Fprintln(os.Stderr, "usage: get <key>")
+				fmt.Fprintln(os.Stderr, "usage: exec <sql>")
 				continue
 			}
-			val, err := db.Get([]byte(parts[1]))
-			if errors.Is(err, dorradb.ErrNotFound) {
-				fmt.Println("(missing)")
-				continue
-			}
+			sql := strings.TrimSpace(line[len(parts[0]):])
+			res, err := db.Exec(sql)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "error: %v\n", err)
 				continue
 			}
-			fmt.Println(string(val))
-		case "set":
-			if len(parts) < 3 {
-				fmt.Fprintln(os.Stderr, "usage: set <key> <value>")
-				continue
+			n, _ := res.RowsAffected()
+			fmt.Printf("ok rows_affected=%d\n", n)
+		case "query", "select":
+			sql := line
+			if cmd != "select" {
+				if len(parts) < 2 {
+					fmt.Fprintln(os.Stderr, "usage: query <sql>")
+					continue
+				}
+				sql = strings.TrimSpace(line[len(parts[0]):])
 			}
-			key := parts[1]
-			val := strings.Join(parts[2:], " ")
-			if err := db.Set([]byte(key), []byte(val)); err != nil {
+			rows, err := db.Query(sql)
+			if err != nil {
 				fmt.Fprintf(os.Stderr, "error: %v\n", err)
 				continue
 			}
-			fmt.Println("saved")
-		case "del", "delete", "rm":
-			if len(parts) < 2 {
-				fmt.Fprintln(os.Stderr, "usage: del <key>")
-				continue
+			cols := rows.Columns()
+			if len(cols) > 0 {
+				fmt.Println(strings.Join(cols, "\t"))
 			}
-			if err := db.Delete([]byte(parts[1])); err != nil {
-				fmt.Fprintf(os.Stderr, "error: %v\n", err)
-				continue
+			for rows.Next() {
+				dest := make([]any, len(cols))
+				ptrs := make([]any, len(cols))
+				for i := range dest {
+					ptrs[i] = &dest[i]
+				}
+				if err := rows.Scan(ptrs...); err != nil {
+					fmt.Fprintf(os.Stderr, "error: %v\n", err)
+					break
+				}
+				parts := make([]string, len(dest))
+				for i, v := range dest {
+					parts[i] = fmt.Sprint(v)
+				}
+				fmt.Println(strings.Join(parts, "\t"))
 			}
-			fmt.Println("deleted")
+			_ = rows.Close()
 		case "stats", "status":
 			s := db.Stats()
 			fmt.Printf("keys=%d  sequence=%d  main=%d bytes  wal=%d bytes\n", s.LiveKeys, s.Sequence, s.MainBytes, s.WALBytes)

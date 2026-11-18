@@ -1,19 +1,13 @@
-// Package dorradb is an embedded key-value store with a clustered B+ tree,
-// WAL, 4 KiB buffer pool, and checkpoints.
+// Package dorradb is an embedded relational store for Go.
 //
-// DorraDB provides ACID transactions. Every read and write runs inside a
-// transaction (AUTOCOMMIT for single Get/Set/Delete/Has, or explicit
-// Begin / Commit / Rollback). Commits are atomic and durable (WAL sync on by
-// default); readers use snapshot isolation; one writer at a time.
+// Open a file, run SQL (CREATE / INSERT / UPDATE / DELETE / SELECT), optionally
+// wrap work in an explicit transaction. Under the hood: clustered B+ trees on
+// 4 KiB slotted pages, a write-ahead log, and snapshot MVCC.
 //
 //	db, err := dorradb.Open("app.dorradb")
+//	_, err = db.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL)`)
+//	_, err = db.Exec(`INSERT INTO t (id, name) VALUES (?, ?)`, int64(1), "Ada")
+//	rows, err := db.Query(`SELECT name FROM t WHERE id = ?`, int64(1))
 //
-//	tx, err := db.Begin(true)
-//	defer tx.Rollback()
-//	_ = tx.Set([]byte("a"), []byte("1"))
-//	_ = tx.Set([]byte("b"), []byte("2"))
-//	err = tx.Commit()
-//
-// Files: path, path+"-wal", path+".lock". One process opens a path (exclusive
-// lock). Do not hold transactions open longer than needed.
+// Or use the database/sql driver registered as "dorradb".
 package dorradb

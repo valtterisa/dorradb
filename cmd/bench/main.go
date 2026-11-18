@@ -176,6 +176,9 @@ func timePutBatch(engine string, nosync bool) (result, error) {
 			return result{}, err
 		}
 		defer db.Close()
+		if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS kv (k BLOB PRIMARY KEY, v BLOB NOT NULL)`); err != nil {
+			return result{}, err
+		}
 		for i := 0; i < batches; i++ {
 			tx, err := db.Begin(true)
 			if err != nil {
@@ -183,7 +186,7 @@ func timePutBatch(engine string, nosync bool) (result, error) {
 			}
 			base := i * batchN
 			for j := 0; j < batchN; j++ {
-				if err := tx.Set(keyOf(base+j), v); err != nil {
+				if _, err := tx.Exec(`INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)`, keyOf(base+j), v); err != nil {
 					_ = tx.Rollback()
 					return result{}, err
 				}
@@ -258,6 +261,9 @@ func timeGetRange(engine string, lo, hi int) (result, error) {
 			return result{}, err
 		}
 		defer db.Close()
+		if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS kv (k BLOB PRIMARY KEY, v BLOB NOT NULL)`); err != nil {
+			return result{}, err
+		}
 		if err := fillDorra(db, v); err != nil {
 			return result{}, err
 		}
@@ -267,10 +273,23 @@ func timeGetRange(engine string, lo, hi int) (result, error) {
 		}
 		start := time.Now()
 		for i := 0; i < getIters; i++ {
-			if _, err := tx.Get(keyOf(lo + rng.Intn(span))); err != nil {
+			rows, err := tx.Query(`SELECT v FROM kv WHERE k = ?`, keyOf(lo+rng.Intn(span)))
+			if err != nil {
 				_ = tx.Rollback()
 				return result{}, err
 			}
+			if !rows.Next() {
+				_ = rows.Close()
+				_ = tx.Rollback()
+				return result{}, dorradb.ErrNotFound
+			}
+			var got []byte
+			if err := rows.Scan(&got); err != nil {
+				_ = rows.Close()
+				_ = tx.Rollback()
+				return result{}, err
+			}
+			_ = rows.Close()
 		}
 		elapsed = time.Since(start)
 		_ = tx.Rollback()
@@ -347,7 +366,7 @@ func fillDorra(db *dorradb.DB, v []byte) error {
 			end = fillN
 		}
 		for j := i; j < end; j++ {
-			if err := tx.Set(keyOf(j), v); err != nil {
+			if _, err := tx.Exec(`INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)`, keyOf(j), v); err != nil {
 				_ = tx.Rollback()
 				return err
 			}

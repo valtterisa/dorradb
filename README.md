@@ -1,8 +1,8 @@
 # DorraDB
 
-DorraDB is an embedded key/value store for Go (Linux, macOS, Windows). It is meant to be a simple, durable library you include in your process — not a separate database server.
+DorraDB is an embedded relational store for Go (Linux, macOS, Windows). It is meant to be a simple, durable library you include in your process — not a separate database server.
 
-The API is small: open a file, get and set byte keys and values, optionally wrap several mutations in one ACID transaction. Under the hood that is a clustered B+ tree on 4 KiB pages, a write-ahead log, and SQLite-WAL-style MVCC (many readers, one writer).
+Use basic SQL (`CREATE TABLE` / `INSERT` / `UPDATE` / `DELETE` / `SELECT`). Under the hood: row records in slotted B+ leaf cells, one clustered tree per table, a write-ahead log, and SQLite-WAL-style MVCC (many readers, one writer).
 
 **Outside pull requests are not accepted.** Open an [issue](https://github.com/valtterisa/dorradb/issues) if something is wrong or unclear. Changes land from the maintainer only.
 
@@ -12,8 +12,8 @@ Licensed under [MIT](LICENSE).
 
 - [Getting Started](#getting-started)
   - [Opening a database](#opening-a-database)
+  - [SQL](#sql)
   - [Transactions](#transactions)
-  - [Using key/value pairs](#using-keyvalue-pairs)
   - [Options](#options)
   - [Statistics](#statistics)
 - [How DorraDB works](#how-dorradb-works)
@@ -50,7 +50,11 @@ func main() {
 	}
 	defer db.Close()
 
-	// ...
+	_, err = db.Exec(`CREATE TABLE users (
+		id INTEGER PRIMARY KEY,
+		name TEXT NOT NULL
+	)`)
+	_, err = db.Exec(`INSERT INTO users (id, name) VALUES (?, ?)`, int64(1), "Ada")
 }
 ```
 
@@ -67,98 +71,61 @@ app.dorradb.lock    # exclusive advisory lock
 
 OS I/O goes through an internal VFS (stdlib + [`gofrs/flock`](https://github.com/gofrs/flock)). Engine code only sees `vfs.FS`.
 
+### SQL
+
+Each table is its own clustered B+ tree; cell payloads are typed row records (INTEGER / TEXT / BLOB). WHERE is equality on the primary key only (for now).
+
+```go
+_, err = db.Exec(`CREATE TABLE users (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  data BLOB
+)`)
+_, err = db.Exec(`INSERT INTO users (id, name, data) VALUES (?, ?, ?)`,
+	int64(1), "alice", []byte{1, 2})
+rows, err := db.Query(`SELECT name FROM users WHERE id = ?`, int64(1))
+defer rows.Close()
+for rows.Next() {
+	var name string
+	_ = rows.Scan(&name)
+}
+```
+
+| Method | Notes |
+| --- | --- |
+| `Exec` | AUTOCOMMIT write (`INSERT` / `UPDATE` / `DELETE` / `CREATE` / `DROP`) |
+| `Query` | AUTOCOMMIT read (`SELECT`); caller must `Close` rows |
+| `Prepare` | Parse once; then `Stmt.Exec` / `Stmt.Query` |
+| `Begin` | Explicit tx; then `Tx.Exec` / `Tx.Query` |
+| `Tx.Commit` / `Tx.Rollback` | Apply or discard buffered writes |
+| `Stats` / `Close` | Sizes / flush and unlock |
+
+Also: `database/sql` driver registered as `"dorradb"`. Unsupported syntax returns a clear parse error.
+
 ### Transactions
 
-DorraDB allows **one writable transaction at a time** and as many **read-only transactions** as you need. Each transaction sees a consistent snapshot of the data as of `Begin` (plus its own buffered writes).
+One writable transaction at a time; many concurrent readers. Each tx sees a snapshot as of `Begin` (plus its own buffered writes).
 
-Every read and write runs inside a transaction:
-
-- `DB.Get` / `Set` / `Delete` / `Has` each open a short **AUTOCOMMIT** transaction, then commit or roll back.
-- `DB.Begin` starts an explicit transaction you commit or roll back yourself.
-
-Do not hold transactions open longer than you need. Open read pins defer checkpoints and keep old MVCC versions alive.
-
-#### AUTOCOMMIT (single ops)
-
-For one-shot work, use the `DB` helpers. They are ordinary transactions under the hood:
+- `DB.Exec` / `DB.Query` use short AUTOCOMMIT transactions.
+- `DB.Begin` starts an explicit transaction you commit or roll back.
 
 ```go
-err = db.Set([]byte("user:1"), []byte(`{"name":"Ada"}`))
-val, err := db.Get([]byte("user:1"))   // copy of the value, or ErrNotFound
-ok, err := db.Has([]byte("user:1"))
-err = db.Delete([]byte("user:1"))      // missing keys are not an error
-```
-
-With default options, a successful `Set` / `Delete` is durable (WAL fsynced) and visible to later readers when the call returns.
-
-#### Explicit transactions
-
-Use `Begin` when several writes must commit together, or when you need a stable read snapshot across multiple gets:
-
-```go
-tx, err := db.Begin(true) // true = writable
-if err != nil {
-	return err
-}
-defer tx.Rollback() // safe after Commit
-
-if err := tx.Set([]byte("a"), []byte("1")); err != nil {
-	return err
-}
-if err := tx.Set([]byte("b"), []byte("2")); err != nil {
-	return err
-}
-return tx.Commit()
-```
-
-```go
-tx, err := db.Begin(false) // read-only
+tx, err := db.Begin(true)
 if err != nil {
 	return err
 }
 defer tx.Rollback()
-
-v, err := tx.Get([]byte("a"))
-// ...
+_, err = tx.Exec(`INSERT INTO users (id, name) VALUES (?, ?)`, int64(2), "Bob")
+_, err = tx.Exec(`INSERT INTO users (id, name) VALUES (?, ?)`, int64(3), "Cyd")
+return tx.Commit()
 ```
-
-The first argument to `Begin` is whether the transaction is writable. Writable callers wait on a mutex until the previous writer finishes. Read-only callers do not wait on the writer.
-
-**ACID in practice:**
 
 | Property | Behavior |
 | --- | --- |
 | Atomic | All buffered ops in a tx commit together, or none do |
-| Consistent | No torn published state; the app owns higher-level invariants (KV has no schema) |
+| Consistent | Schema + typed rows; constraint errors abort the statement |
 | Isolated | Snapshot at `Begin`; one writer at a time (like SQLite WAL) |
 | Durable | WAL fsync on commit unless `DisableSync` |
-
-Writes are buffered in memory until `Commit`. Rollback discards them.
-
-### Using key/value pairs
-
-Keys and values are opaque `[]byte`. Keys are ordered in a clustered B+ tree (byte-sorted), so related prefixes land near each other on disk.
-
-```go
-err := db.Set([]byte("answer"), []byte("42"))
-v, err := db.Get([]byte("answer"))
-fmt.Printf("The answer is: %s\n", v)
-```
-
-`Get` always returns a **copy**. Unlike Bolt, you may keep that slice after the transaction ends. Empty keys are rejected (`ErrInvalidKey`). Missing keys return `ErrNotFound` from `Get` (check with `errors.Is`).
-
-| Method | Notes |
-| --- | --- |
-| `Get` | AUTOCOMMIT read; copy of value, or `ErrNotFound` |
-| `Set` | AUTOCOMMIT write; durable when WAL sync is on (default) |
-| `Delete` | AUTOCOMMIT write; missing keys are not an error |
-| `Has` | AUTOCOMMIT read; existence without copying the value |
-| `Begin` | Start a tx (`writable`); then `Get`/`Set`/`Delete`/`Has` on `Tx` |
-| `Tx.Commit` / `Tx.Rollback` | Apply or discard buffered writes |
-| `Stats` | Path, sequences, pins, sizes, cache |
-| `Close` | Flush, unlock, close files (waits for open tx pins) |
-
-Limits: key 1–1024 bytes; value up to 4 MiB.
 
 ### Options
 
@@ -200,23 +167,24 @@ Check with `errors.Is`:
 
 | Error | When |
 | --- | --- |
-| `ErrNotFound` | `Get` on a missing key |
-| `ErrInvalidKey` | Empty key |
-| `ErrTooLarge` | Key > 1 KiB or value > 4 MiB |
+| `ErrNotFound` | Missing row / key in engine lookups |
+| `ErrTableNotFound` / `ErrTableExists` | Bad / duplicate `CREATE` / `DROP` |
+| `ErrConstraint` | e.g. duplicate PK on plain `INSERT` |
+| `ErrTooLarge` | Row payload > 4 MiB |
 | `ErrLocked` | Another process holds the advisory lock |
 | `ErrClosed` | Use after `Close` |
 | `ErrTxClosed` | Use of a tx after `Commit` / `Rollback` |
-| `ErrTxNotWritable` | `Set` / `Delete` on a read-only tx |
+| `ErrTxNotWritable` | Write on a read-only tx |
 | `ErrCorrupt` | Bad magic, mid-file CRC failure, etc. |
 | `ErrUnsupportedVersion` | On-disk `formatVersion` newer than this build |
 
 ## How DorraDB works
 
-Think of three layers: the public API, the write-ahead log, and the **clustered B+ tree** that holds every key.
+Think of three layers: SQL, the write-ahead log, and **clustered B+ trees** (one per table) on the shared buffer pool.
 
 ### Clustered B+ tree
 
-All user data lives in one B+ tree rooted at `TableRoot` in the meta page (`internal/btree`). “Clustered” means the leaf pages *are* the table: each leaf cell stores the user key and its value(s), not a pointer into a separate heap. Keys are compared as raw bytes (lexicographic), so prefixes like `user:…` stay near each other on disk.
+Each SQL table is a clustered B+ tree. The bootstrap tree (header `TableRoot`) holds the catalog. “Clustered” means leaf pages *are* the table: each leaf cell stores the primary key plus a typed row-record payload (MVCC version chain), not a pointer into a separate heap.
 
 ```text
                     [internal]
@@ -288,10 +256,9 @@ Useful entry points if you want to see how the pieces connect:
 ## Caveats & Limitations
 
 - **One process per path.** Exclusive lock; no multi-process sharing.
-- **One writer.** Concurrent `Set` / writable `Begin` serialize. Readers run in parallel and do not wait on the writer goroutine (same process).
+- **One writer.** Concurrent writable `Begin` / `Exec` serialize. Readers run in parallel and do not wait on the writer goroutine (same process).
 - **Keep transactions short.** Long-lived read pins block checkpoints and keep old versions around. A single hot key can only retain around 60–100 versions still needed by open snapshots (`ErrTooBig` after that), so long readers on a busy key will eventually fail writers.
-- **No buckets / no SQL yet.** Flat key space; nest namespaces in the key bytes yourself (e.g. `users/1`). Query planner / SQL are on the roadmap.
-- **No public range / cursor API yet.** The tree is ordered; iteration will come with the query layer.
+- **SQL dialect is small.** PK equality `WHERE` only; no joins, secondary indexes, or rich expressions yet.
 - **Underfull leaves are not merged.** Deletes leave space until vacuum / reuse patterns catch up.
 - **Overflow pages** written just before a crash can leak as unused space (not corruption).
 - **Reliability bar for production** (crash/recovery stress, fuzz, backup, verify, format migrations) is still in progress — see Goals.
@@ -317,12 +284,9 @@ go run ./cmd/dorradb
 ```
 
 ```text
-dorradb> set name Ada
-saved
-dorradb> get name
-Ada
-dorradb> del name
-deleted
+dorradb> exec CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL)
+dorradb> exec INSERT INTO t (id, name) VALUES (1, 'Ada')
+dorradb> query SELECT name FROM t WHERE id = 1
 dorradb> stats
 dorradb> quit
 ```
@@ -332,16 +296,14 @@ Path: `--db PATH`, `--db=PATH`, or env `DORRADB_PATH` (default `./app.dorradb`).
 One-shot:
 
 ```bash
-go run ./cmd/dorradb set name Ada
-go run ./cmd/dorradb get name
-go run ./cmd/dorradb delete name
+go run ./cmd/dorradb exec "INSERT INTO t (id, name) VALUES (2, 'Bob')"
+go run ./cmd/dorradb query "SELECT * FROM t"
 go run ./cmd/dorradb status
-go run ./cmd/dorradb set blob -   # value from stdin
 ```
 
-`--json` formats `get` / `status` as JSON. `version` prints `dorradb 0.1.0`.
+`--json` formats `query` / `status` as JSON. `version` prints `dorradb 0.1.0`.
 
-Exit codes: `0` ok, `1` error, `2` key not found (`get`).
+Exit codes: `0` ok, `1` error.
 
 ## Goals
 
@@ -356,10 +318,11 @@ Exit codes: `0` ok, `1` error, `2` key not found (`get`).
 
 - [ ] Crash/recovery tests, concurrent stress, fuzz, durability docs, format migrations, backup, corruption/verify
 
-### Later (SQL)
+### SQL
 
-- [x] **Clustered B+ tree** on the buffer pool
-- [ ] **Query planner**
+- [x] **Basic SQL** — CREATE / INSERT / UPDATE / DELETE / SELECT; typed rows; multi-table
+- [x] **Clustered B+ tree** per table on the buffer pool
+- [ ] **Query planner** / richer WHERE / indexes / joins
 - [ ] **Query engine**
 - [ ] **SQL** — parser + bind to the planner/engine
 
